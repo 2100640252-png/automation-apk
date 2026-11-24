@@ -483,15 +483,8 @@ fun AutomationApp(activity: MainActivity) {
                     Text("当前版本：v${UpdateChecker.currentVersionName(activity)}")
                     Text("新版发布后，点“检查更新”，有新版直接在软件内下载安装，不用去网页、不用解压 zip。")
                     Spacer(Modifier.height(8.dp))
-                    Text("仓库是私有的，第一次需要填一次 GitHub 只读 Token：去 github.com/settings/tokens 建一个 fine-grained Token，只勾 automation-apk 的 Contents 只读，粘贴到下面，保存一次就行，Token 只存在本机。")
-                    OutlinedTextField(
-                        value = activity.githubToken,
-                        onValueChange = { activity.githubToken = it },
-                        label = { Text("GitHub 只读 Token（只存本机）") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
+                    Text("不用填 Token，直接点“检查更新”就行。")
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { activity.saveToken(activity.githubToken) }) { Text("保存 Token") }
                         Button(onClick = { activity.checkUpdate() }) { Text("检查更新") }
                     }
                     Spacer(Modifier.height(8.dp))
