@@ -12,8 +12,8 @@ android {
         applicationId = "com.automation.work"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "1.6.0"
+        versionCode = 8
+        versionName = "1.7.0"
     }
 
     // 固定签名（v1.4 新增）：用同一把签名钥匙签每一个 Release 包，
@@ -69,6 +69,7 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.3.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.5")
     implementation("androidx.work:work-runtime-ktx:2.9.0")
+    implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     debugImplementation("androidx.compose.ui:ui-tooling:1.7.2")
 }
