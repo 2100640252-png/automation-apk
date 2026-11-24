@@ -24,6 +24,8 @@ import java.util.UUID
 class MainActivity : ComponentActivity() {
 
     var videos by mutableStateOf(listOf<StoredVideo>())
+    var detectedPlatforms by mutableStateOf(listOf<PlatformApp>())
+    var myPublishedLinks by mutableStateOf(listOf<String>())
     var permissionStatus by mutableStateOf(listOf<PermissionHelper.PermissionStatus>())
     var logText by mutableStateOf("暂无运行记录。")
     var taskStatus by mutableStateOf("未开始")
@@ -47,6 +49,8 @@ class MainActivity : ComponentActivity() {
         refreshVideos()
         refreshPermissions()
         refreshLog()
+        refreshPlatforms()
+        myPublishedLinks = TaskStore.loadMyPublishedLinks(this)
         // 启动就主动索取权限：这是 v1.0 打开没反应的直接原因，v1.1 改成一打开就申请。
         permissionLauncher.launch(PermissionHelper.runtimePermissions.toTypedArray())
         setContent { AutomationApp(this) }
@@ -62,6 +66,62 @@ class MainActivity : ComponentActivity() {
 
     fun refreshVideos() {
         videos = TaskStore.loadVideos(this)
+    }
+
+    fun refreshPlatforms() {
+        detectedPlatforms = AppDetector.detect(this)
+    }
+
+    fun openPlatform(packageName: String) {
+        if (!AppDetector.openApp(this, packageName)) {
+            taskStatus = "打不开：手机没装这个应用，请先安装。"
+        } else {
+            taskStatus = "已打开应用。"
+        }
+        refreshLog()
+    }
+
+    /** 随机发布测试：从视频库随机挑一个视频，交给抖音发布页，文案随机。 */
+    fun publishRandomVideoToDouyin() {
+        val video = RandomContent.randomVideo(videos)
+        if (video == null) {
+            taskStatus = "视频库是空的，请先在视频版选一个视频存进来。"
+            return
+        }
+        if (!detectedPlatforms.any { it.packageName == "com.ss.android.ugc.aweme" && it.installed }) {
+            refreshPlatforms()
+            if (!detectedPlatforms.any { it.packageName == "com.ss.android.ugc.aweme" && it.installed }) {
+                taskStatus = "手机没装抖音，请先安装抖音并登录你的账号。"
+                return
+            }
+        }
+        val caption = RandomContent.randomCaption()
+        if (AppDetector.openDouyinPublish(this, video.path, caption)) {
+            taskStatus = "已把随机视频交给抖音发布页：${video.name}，文案：$caption，请在抖音里点发布确认。"
+        } else {
+            taskStatus = "打开抖音发布页失败，请确认抖音已安装并登录。"
+        }
+        refreshLog()
+    }
+
+    /** 随机评论到自己已发布的视频：随机挑一条链接 + 随机评论，开始任务。 */
+    fun commentRandomToMyVideo() {
+        val links = TaskStore.loadMyPublishedLinks(this)
+        if (links.isEmpty()) {
+            taskStatus = "请先在下方填你抖音账号里已发布视频的链接（每行一条），保存后再点随机评论。"
+            return
+        }
+        val link = links.random()
+        val comment = RandomContent.randomComment()
+        taskStatus = "随机评论测试：挑中 $link，评论：$comment"
+        startCommentTask(listOf(link), comment, 10)
+    }
+
+    fun saveMyPublishedLinks(raw: String) {
+        val links = raw.split("\n").map { it.trim() }.filter { it.isNotBlank() }
+        TaskStore.saveMyPublishedLinks(this, links)
+        myPublishedLinks = links
+        taskStatus = "已保存 ${links.size} 条已发布视频链接。"
     }
 
     fun refreshPermissions() {
@@ -235,6 +295,7 @@ fun AutomationApp(activity: MainActivity) {
                 Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("视频版") })
                 Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("评论版") })
                 Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("更新") })
+                Tab(selected = tab == 3, onClick = { tab = 3; activity.refreshPlatforms() }, text = { Text("平台") })
             }
             Spacer(Modifier.height(12.dp))
 
@@ -370,6 +431,50 @@ fun AutomationApp(activity: MainActivity) {
                     TaskStore.clearLog(activity)
                     activity.refreshLog()
                 }) { Text("清空日志") }
+            } else if (tab == 3) {
+                // 平台页：检测手机装了什么，直接打开；随机发布、随机评论测试。
+                var myLinksText by remember { mutableStateOf(activity.myPublishedLinks.joinToString("\n")) }
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Text("平台检测：手机上装了什么，直接打开", style = MaterialTheme.typography.titleMedium)
+                    Spacer(Modifier.height(8.dp))
+                    TextButton(onClick = { activity.refreshPlatforms() }) { Text("重新检测") }
+                    activity.detectedPlatforms.forEach { p ->
+                        Card(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                            Row(
+                                Modifier.fillMaxWidth().padding(10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("${p.name}：${if (p.installed) "已安装 ${p.versionName}" else "未安装"}")
+                                if (p.installed) {
+                                    TextButton(onClick = { activity.openPlatform(p.packageName) }) { Text("打开") }
+                                }
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text("抖音真实发布测试", style = MaterialTheme.typography.titleMedium)
+                    Text("从视频库随机挑一个视频，交给抖音发布页，文案随机，点发布前在抖音里确认。")
+                    Button(
+                        onClick = { activity.publishRandomVideoToDouyin() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("随机发布一条视频到抖音") }
+                    Spacer(Modifier.height(12.dp))
+                    Text("随机评论到我已发布的视频", style = MaterialTheme.typography.titleMedium)
+                    Text("先把你抖音账号里已发布视频的链接贴下面，每行一条，保存后点随机评论，会随机挑一条、随机写一句评论去发。")
+                    OutlinedTextField(
+                        value = myLinksText,
+                        onValueChange = { myLinksText = it },
+                        label = { Text("我已发布的视频链接，每行一条") },
+                        modifier = Modifier.fillMaxWidth().height(120.dp)
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { activity.saveMyPublishedLinks(myLinksText) }) { Text("保存链接") }
+                        Button(onClick = { activity.commentRandomToMyVideo() }) { Text("随机评论一条") }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text(activity.taskStatus)
+                    Text(activity.logText, modifier = Modifier.fillMaxWidth().height(120.dp).verticalScroll(rememberScrollState()))
+                }
             } else {
                 // 更新页：软件内更新，不用去网页下载、不用解压。
                 Column(Modifier.verticalScroll(rememberScrollState())) {
