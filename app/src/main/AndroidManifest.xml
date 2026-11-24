@@ -67,6 +67,13 @@
             </intent-filter>
         </activity>
 
+        <!-- Shizuku 客户端：无线调试权限，不用 Root 也能跑系统命令 -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true" />
+
         <!-- 软件内更新用的 FileProvider：把缓存里的新版 APK 交给系统安装器 -->
         <provider
             android:name="androidx.core.content.FileProvider"
