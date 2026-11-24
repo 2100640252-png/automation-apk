@@ -15,7 +15,7 @@ import java.net.URL
 /**
  * 软件内更新（v1.1 新增）：
  * 1. 查 GitHub Releases 最新版（tag 如 v1.0.7），和本机 versionName 比较。
- * 2. 有新版就在软件内直接下载 app-debug.apk 到应用缓存，再调系统安装器安装，
+ * 2. 有新版就在软件内直接下载 app-release.apk 到应用缓存，再调系统安装器安装，
  *    不用去网页上手动下载、不用解压 zip。
  *
  * v1.3.0：仓库已改为公开，更新不再需要 Token。
@@ -77,14 +77,14 @@ object UpdateChecker {
                 if (assets != null) {
                     for (i in 0 until assets.length()) {
                         val a = assets.optJSONObject(i) ?: continue
-                        if (a.optString("name") == "app-debug.apk") {
+                        if (a.optString("name") == "app-release.apk") {
                             apkUrl = a.optString("browser_download_url", "")
                             size = a.optLong("size", 0)
                         }
                     }
                 }
                 if (tag.isBlank() || apkUrl.isBlank()) {
-                    handler.post { onResult(null, "最新版里没有找到 app-debug.apk，请稍后重试。") }
+                    handler.post { onResult(null, "最新版里没有找到 app-release.apk，请稍后重试。") }
                     return@Thread
                 }
                 // tag 形如 v1.1.8（1.1 是版本号，8 是构建号），只比较前两段：
