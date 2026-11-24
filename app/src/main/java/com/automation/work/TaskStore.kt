@@ -121,6 +121,28 @@ object TaskStore {
             .putString(KEY_COMMENT_TASK, json).apply()
     }
 
+    // 自己已发布的视频链接（抖音主页里已发布的视频），随机评论测试用。
+    private const val KEY_MY_VIDEOS = "my_published_links"
+
+    fun saveMyPublishedLinks(context: Context, links: List<String>) {
+        val arr = JSONArray()
+        for (l in links) arr.put(l)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_MY_VIDEOS, arr.toString()).apply()
+    }
+
+    fun loadMyPublishedLinks(context: Context): List<String> {
+        val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_MY_VIDEOS, "[]") ?: "[]"
+        val out = mutableListOf<String>()
+        try {
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) out.add(arr.optString(i))
+        } catch (e: Exception) {
+        }
+        return out.filter { it.isNotBlank() }
+    }
+
     fun loadCommentTask(context: Context): String? {
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(KEY_COMMENT_TASK, null)
