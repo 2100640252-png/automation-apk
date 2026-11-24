@@ -104,6 +104,43 @@ class MainActivity : ComponentActivity() {
         refreshLog()
     }
 
+    /** 立即发布：把选中的视频用系统分享直接交给所选平台的发布页（真发布流程）。 */
+    fun publishNow(video: StoredVideo, platforms: List<String>, copy: ParsedCopy) {
+        if (platforms.isEmpty()) {
+            taskStatus = "请先勾选至少一个平台。"
+            return
+        }
+        val caption = listOf(copy.body, copy.topics.joinToString(" ") { "#$it" }, copy.statement)
+            .filter { it.isNotBlank() }.joinToString("\n")
+        var ok = 0
+        var fail = 0
+        for (platform in platforms) {
+            if (AppDetector.publishVideo(this, platform, video.path, caption)) ok++ else fail++
+        }
+        taskStatus = if (fail == 0) {
+            "已把视频交给 ${platforms.joinToString("、")} 的发布页，请在各平台里点发布确认（共 $ok 个平台）。"
+        } else {
+            "发布结果：成功 $ok 个平台，失败 $fail 个平台。失败原因写在日志里，请先看日志。"
+        }
+        refreshLog()
+    }
+
+    /** 平台页“发视频”：从视频库随机挑一个，直接交给该平台发布页。 */
+    fun publishRandomVideoToPlatform(platform: String) {
+        val video = RandomContent.randomVideo(videos)
+        if (video == null) {
+            taskStatus = "视频库是空的，请先在视频版选一个视频存进来。"
+            return
+        }
+        val caption = RandomContent.randomCaption()
+        if (AppDetector.publishVideo(this, platform, video.path, caption)) {
+            taskStatus = "已把随机视频交给 $platform 发布页：${video.name}，请在 $platform 里点发布确认。"
+        } else {
+            taskStatus = "发视频到 $platform 失败，原因写在日志里，请先看日志。"
+        }
+        refreshLog()
+    }
+
     /** 随机评论到自己已发布的视频：随机挑一条链接 + 随机评论，开始任务。 */
     fun commentRandomToMyVideo() {
         val links = TaskStore.loadMyPublishedLinks(this)
@@ -368,6 +405,21 @@ fun AutomationApp(activity: MainActivity) {
                                 activity.taskStatus = "请先选择一个视频。"
                             } else {
                                 val copy = parsed ?: CopyParser.parse(copyText)
+                                activity.publishNow(video, selectedPlatforms.toList(), copy)
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("立即发布这个视频（直交平台发布页）") }
+                    Spacer(Modifier.height(8.dp))
+                    Text("定时只是提醒：到时间发通知，点通知回来再一键发布，软件不能在后台悄悄替你发。")
+                    Button(
+                        onClick = {
+                            val video = activity.videos.firstOrNull { it.id == selectedVideoId }
+                                ?: activity.videos.firstOrNull()
+                            if (video == null) {
+                                activity.taskStatus = "请先选择一个视频。"
+                            } else {
+                                val copy = parsed ?: CopyParser.parse(copyText)
                                 activity.scheduleVideo(
                                     video, selectedPlatforms.toList(),
                                     minutesAfter.toIntOrNull() ?: 10, copy
@@ -375,7 +427,7 @@ fun AutomationApp(activity: MainActivity) {
                             }
                         },
                         modifier = Modifier.fillMaxWidth()
-                    ) { Text("定时发布这个视频") }
+                    ) { Text("定时提醒这个视频") }
                     Text(activity.taskStatus)
                 }
             } else if (tab == 1) {
@@ -433,7 +485,7 @@ fun AutomationApp(activity: MainActivity) {
                 }) { Text("清空日志") }
             } else if (tab == 3) {
                 // 平台页：检测手机装了什么，直接打开；随机发布、随机评论测试。
-                var myLinksText by remember { mutableStateOf(activity.myPublishedLinks.joinToString("\n")) }
+                var myLinksText by remember(activity.myPublishedLinks) { mutableStateOf(activity.myPublishedLinks.joinToString("\n")) }
                 Column(Modifier.verticalScroll(rememberScrollState())) {
                     Text("平台检测：手机上装了什么，直接打开", style = MaterialTheme.typography.titleMedium)
                     Spacer(Modifier.height(8.dp))
@@ -446,7 +498,10 @@ fun AutomationApp(activity: MainActivity) {
                             ) {
                                 Text("${p.name}：${if (p.installed) "已安装 ${p.versionName}" else "未安装"}")
                                 if (p.installed) {
-                                    TextButton(onClick = { activity.openPlatform(p.packageName) }) { Text("打开") }
+                                    Row {
+                                        TextButton(onClick = { activity.openPlatform(p.packageName) }) { Text("打开") }
+                                        TextButton(onClick = { activity.publishRandomVideoToPlatform(p.name) }) { Text("发视频") }
+                                    }
                                 }
                             }
                         }
