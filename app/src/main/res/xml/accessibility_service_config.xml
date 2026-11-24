@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewClicked"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagReportViewIds"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_description"
+    android:notificationTimeout="100"
+    android:packageNames="com.ss.android.ugc.aweme,com.smile.gifmaker,com.xingin.xhs,com.tencent.mm,com.bilibili.app.in,com.zhiliaoapp.musically,com.google.android.youtube,com.sina.weibo"
+    android:settingsActivity="com.automation.work.MainActivity" />
