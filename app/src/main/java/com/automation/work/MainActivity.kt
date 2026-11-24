@@ -30,6 +30,8 @@ class MainActivity : ComponentActivity() {
     var logText by mutableStateOf("暂无运行记录。")
     var taskStatus by mutableStateOf("未开始")
     var updateStatus by mutableStateOf("")
+    var selfCheckText by mutableStateOf("还没自检，点“运行启动自检”。")
+    var rootStatus by mutableStateOf("未知")
     var updateInfo: UpdateChecker.UpdateInfo? by mutableStateOf(null)
     var githubToken by mutableStateOf("")
 
@@ -254,6 +256,82 @@ class MainActivity : ComponentActivity() {
         refreshLog()
     }
 
+    /** 启动自检（v1.6）：逐项实测，逐项报通过或失败，不写假的“已完成”。 */
+    fun runSelfCheck() {
+        val lines = mutableListOf<String>()
+        val (rootOk, rootMsg) = RootHelper.checkRoot()
+        rootStatus = if (rootOk) "已 Root" else "未 Root"
+        lines.add("Root 权限：${if (rootOk) "通过" else "不通过"}——$rootMsg")
+        refreshPlatforms()
+        val dy = detectedPlatforms.firstOrNull { it.packageName == "com.ss.android.ugc.aweme" }
+        lines.add("抖音安装：${if (dy?.installed == true) "通过（${dy.versionName}）" else "不通过——手机没装抖音"}")
+        val accOk = PermissionHelper.isAccessibilityEnabled(this)
+        lines.add("无障碍服务：${if (accOk) "通过——已开启" else "不通过——没开，Root 评论填中文要用它，去权限面板开"}")
+        lines.add("视频库：${videos.size} 个视频${if (videos.isEmpty()) "——还是空的，先存一个视频" else ""}")
+        val linksOk = TaskStore.loadMyPublishedLinks(this).isNotEmpty()
+        lines.add("已发布链接：${if (linksOk) "通过（${TaskStore.loadMyPublishedLinks(this).size} 条）" else "不通过——平台页里还没保存已发布视频链接"}")
+        selfCheckText = lines.joinToString("\n")
+        TaskStore.appendLog(this, "启动自检：\n" + selfCheckText)
+        taskStatus = if (rootOk && dy?.installed == true) "自检通过，可以开始 Root 自动化。" else "自检有不通过的项，请先看上面哪一项。"
+        refreshLog()
+    }
+
+    /** 用 Root 直接启动抖音（monkey 按包名启动，不依赖无障碍）。 */
+    fun openDouyinByRoot() {
+        val (rootOk, rootMsg) = RootHelper.checkRoot()
+        if (!rootOk) {
+            taskStatus = "Root 不可用：$rootMsg"
+            return
+        }
+        val r = RootHelper.runAsRoot("monkey -p com.ss.android.ugc.aweme -c android.intent.category.LAUNCHER 1")
+        taskStatus = if (r.exitCode == 0) "Root 已启动抖音。" else "Root 启动抖音失败：${r.output.take(150)}"
+        TaskStore.appendLog(this, taskStatus)
+        refreshLog()
+    }
+
+    /** Root 评论任务：后台线程逐条跑 Root 引擎，成功失败分开计。 */
+    fun startRootCommentTask(links: List<String>, comment: String, intervalSec: Int) {
+        val items = links.filter { it.isNotBlank() }
+        if (items.isEmpty()) {
+            taskStatus = "请至少填写 1 个视频链接。"
+            return
+        }
+        if (comment.isBlank()) {
+            taskStatus = "请先填写自定义评论内容。"
+            return
+        }
+        val (rootOk, rootMsg) = RootHelper.checkRoot()
+        if (!rootOk) {
+            taskStatus = "Root 不可用，跑不了 Root 评论：$rootMsg"
+            return
+        }
+        taskStatus = "Root 评论任务开始：共 ${items.size} 条…"
+        TaskStore.appendLog(this, taskStatus)
+        refreshLog()
+        Thread {
+            var ok = 0
+            var fail = 0
+            for ((i, link) in items.withIndex()) {
+                val (done, reason) = RootAutomator.commentOnVideo(this, link, comment)
+                if (done) ok++ else {
+                    fail++
+                    TaskStore.appendLog(this, "第 ${i + 1} 条失败：$reason")
+                }
+                runOnUiThread {
+                    taskStatus = "Root 评论进行中：成功 $ok 条，失败 $fail 条（共 ${items.size} 条）"
+                    refreshLog()
+                }
+                if (i < items.size - 1) Thread.sleep(intervalSec.coerceAtLeast(1) * 1000L)
+            }
+            runOnUiThread {
+                taskStatus = "Root 评论任务结束：成功 $ok 条，失败 $fail 条。" +
+                    if (fail > 0) "失败原因写在日志里。" else ""
+                TaskStore.appendLog(this, taskStatus)
+                refreshLog()
+            }
+        }.start()
+    }
+
     fun checkUpdate() {
         updateStatus = "正在检查更新…"
         UpdateChecker.checkForUpdate(this) { info, msg ->
@@ -333,6 +411,7 @@ fun AutomationApp(activity: MainActivity) {
                 Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("评论版") })
                 Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("更新") })
                 Tab(selected = tab == 3, onClick = { tab = 3; activity.refreshPlatforms() }, text = { Text("平台") })
+                Tab(selected = tab == 4, onClick = { tab = 4; activity.runSelfCheck() }, text = { Text("Root") })
             }
             Spacer(Modifier.height(12.dp))
 
@@ -529,6 +608,44 @@ fun AutomationApp(activity: MainActivity) {
                     Spacer(Modifier.height(8.dp))
                     Text(activity.taskStatus)
                     Text(activity.logText, modifier = Modifier.fillMaxWidth().height(120.dp).verticalScroll(rememberScrollState()))
+                }
+            } else if (tab == 4) {
+                // Root 页：Root 自动化引擎 + 启动自检，逐项实测、不写假结果。
+                var rootLinksText by remember(activity.myPublishedLinks) { mutableStateOf(activity.myPublishedLinks.joinToString("\n")) }
+                var rootComment by remember { mutableStateOf("") }
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Text("Root 自动化：全程手机本地跑，不用接电脑", style = MaterialTheme.typography.titleMedium)
+                    Text("Root 就是开发者权限：有了它，软件自己在手机上跑系统命令（打开应用、读界面、点按屏幕），不用无障碍服务一直活着，也不用电脑。")
+                    Spacer(Modifier.height(8.dp))
+                    Text("Root 状态：${activity.rootStatus}")
+                    Button(onClick = { activity.runSelfCheck() }, modifier = Modifier.fillMaxWidth()) {
+                        Text("运行启动自检")
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text(activity.selfCheckText)
+                    Spacer(Modifier.height(12.dp))
+                    Text("Root 测试", style = MaterialTheme.typography.titleMedium)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { activity.openDouyinByRoot() }) { Text("用 Root 打开抖音") }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Text("Root 评论测试", style = MaterialTheme.typography.titleMedium)
+                    Text("用 Root 引擎给已发布视频发评论：先打开链接、读界面确认、点评论入口、填评论、点发送，每一步都验证，失败写原因。")
+                    OutlinedTextField(
+                        value = rootComment,
+                        onValueChange = { rootComment = it },
+                        label = { Text("评论内容") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text("链接用平台页保存的已发布视频链接（${activity.myPublishedLinks.size} 条），没有就先去平台页保存。")
+                    Button(
+                        onClick = { activity.startRootCommentTask(activity.myPublishedLinks, rootComment, 10) },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("开始 Root 评论任务") }
+                    Spacer(Modifier.height(8.dp))
+                    Text(activity.taskStatus)
+                    Text(activity.logText, modifier = Modifier.fillMaxWidth().height(140.dp).verticalScroll(rememberScrollState()))
                 }
             } else {
                 // 更新页：软件内更新，不用去网页下载、不用解压。
