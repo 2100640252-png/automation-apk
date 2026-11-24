@@ -39,7 +39,7 @@ jobs:
       - name: Publish APK as Release asset
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.5.${{ github.run_number }}
-          name: 自动化工作 APK v1.5.${{ github.run_number }}
+          tag_name: v1.6.${{ github.run_number }}
+          name: 自动化工作 APK v1.6.${{ github.run_number }}
           files: app/build/outputs/apk/release/app-release.apk
           fail_on_unmatched_files: true
