@@ -47,6 +47,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Shizuku 授权结果回来就刷新自检状态。
+        try {
+            rikka.shizuku.Shizuku.addRequestPermissionResultListener { _, _ -> runSelfCheck() }
+        } catch (e: Exception) {
+        }
         githubToken = TaskStore.loadGithubToken(this)
         refreshVideos()
         refreshPermissions()
@@ -262,6 +267,8 @@ class MainActivity : ComponentActivity() {
         val (rootOk, rootMsg) = RootHelper.checkRoot()
         rootStatus = if (rootOk) "已 Root" else "未 Root"
         lines.add("Root 权限：${if (rootOk) "通过" else "不通过"}——$rootMsg")
+        val (szOk, szMsg) = ShizukuHelper.checkShizuku()
+        lines.add("Shizuku：${if (szOk) "通过" else "不通过"}——$szMsg")
         refreshPlatforms()
         val dy = detectedPlatforms.firstOrNull { it.packageName == "com.ss.android.ugc.aweme" }
         lines.add("抖音安装：${if (dy?.installed == true) "通过（${dy.versionName}）" else "不通过——手机没装抖音"}")
@@ -618,6 +625,11 @@ fun AutomationApp(activity: MainActivity) {
                     Text("Root 就是开发者权限：有了它，软件自己在手机上跑系统命令（打开应用、读界面、点按屏幕），不用无障碍服务一直活着，也不用电脑。")
                     Spacer(Modifier.height(8.dp))
                     Text("Root 状态：${activity.rootStatus}")
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { ShizukuHelper.requestPermission() }) { Text("申请 Shizuku 授权") }
+                        Button(onClick = { activity.runSelfCheck() }) { Text("重新检测 Shizuku") }
+                    }
+                    Text("Shizuku 不用 Root：装 Shizuku App，开发者模式里开无线调试配对启动，再点上面申请授权。")
                     Button(onClick = { activity.runSelfCheck() }, modifier = Modifier.fillMaxWidth()) {
                         Text("运行启动自检")
                     }
