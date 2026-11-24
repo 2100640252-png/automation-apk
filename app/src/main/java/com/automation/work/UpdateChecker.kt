@@ -18,11 +18,9 @@ import java.net.URL
  * 2. 有新版就在软件内直接下载 app-debug.apk 到应用缓存，再调系统安装器安装，
  *    不用去网页上手动下载、不用解压 zip。
  *
- * 注意：仓库是私有的，GitHub API 不带 Token 会返回 404。
- * 所以设置里留了一个 Token 输入框：用户在 GitHub 上建一个只读的
- * fine-grained Token（只勾 automation-apk 仓库的 Contents 只读），
- * 粘贴一次存在本机，以后更新就全在软件内完成。
- * Token 只存在本机 SharedPreferences，不上传、不外发给其他地方。
+ * v1.3.0：仓库已改为公开，更新不再需要 Token。
+ * 查最新版不用带 Token，直接调公开的 GitHub API 就行。
+ * Token 字段保留兼容（以前填过的 Token 仍会被带上，但不填也完全能用）。
  */
 object UpdateChecker {
     data class UpdateInfo(
@@ -60,7 +58,7 @@ object UpdateChecker {
                     handler.post {
                         onResult(
                             null,
-                            "仓库是私有的，查不到新版：请在下方填一次 GitHub 只读 Token（只勾 automation-apk 的 Contents 只读），保存后再点检查更新。"
+                            "查不到新版（网络返回 404），请检查网络后重试，不用填 Token。"
                         )
                     }
                     return@Thread
