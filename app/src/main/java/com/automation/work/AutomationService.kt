@@ -36,13 +36,26 @@ class AutomationService : AccessibilityService() {
         var currentIndex: Int = 0
         var running: Boolean = false
         var lastStatus: String = "未开始"
+        // v1.5 诚实上报：成功和失败分开计，绝不再用“已处理”冒充“已发送”。
+        var successCount: Int = 0
+        var failCount: Int = 0
 
         private val handler = Handler(Looper.getMainLooper())
         private var stepRunnable: Runnable? = null
 
         fun startTask(context: Context, task: CommentTask) {
+            // v1.5：无障碍服务没在运行就坚决不启动——以前是先把链接打开了，
+            // 服务却没接管，任务就悄悄卡死，用户还以为在跑。
+            if (instance == null) {
+                running = false
+                lastStatus = "无障碍服务没在运行：请先在设置 > 无障碍里开启“自动化屏幕控制”，再点开始任务。"
+                TaskStore.appendLog(context, lastStatus)
+                return
+            }
             currentTask = task
             currentIndex = 0
+            successCount = 0
+            failCount = 0
             running = true
             lastStatus = "任务开始：共 ${task.items.size} 条"
             TaskStore.appendLog(context, lastStatus)
@@ -64,27 +77,45 @@ class AutomationService : AccessibilityService() {
             val task = currentTask ?: return
             if (!running || currentIndex >= task.items.size) {
                 running = false
-                lastStatus = "任务完成：${task.items.size} 条已处理"
+                lastStatus = finishStatus()
                 TaskStore.appendLog(context, lastStatus)
                 return
             }
             val item = task.items[currentIndex]
             lastStatus = "正在打开第 ${item.index} 条：${item.link}"
             TaskStore.appendLog(context, lastStatus)
-            openVideoLink(context, item.link)
+            if (!openVideoLink(context, item.link)) {
+                // 链接根本打不开：记失败、直接跳过，别傻等 10 秒再假装处理。
+                markItemFailed(context, "打不开链接")
+                advance(context, task)
+                return
+            }
             // 打开后由 onAccessibilityEvent 驱动下一步；同时设一个兜底定时器，
             // 万一收不到窗口事件，10 秒后也尝试找评论框。
             instance?.scheduleStep(context, 10000L)
         }
 
-        fun openVideoLink(context: Context, link: String) {
-            try {
-                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(link)).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-                context.startActivity(intent)
-            } catch (e: Exception) {
-                TaskStore.appendLog(context, "打开链接失败：${e.message}")
+        fun openVideoLink(context: Context, link: String): Boolean {
+            // v1.5：走 LinkResolver，抖音短链解析成深链直开抖音 App；
+            // 返回 false 时调用方记失败，不再当成已打开。
+            return LinkResolver.openVideoLink(context, link)
+        }
+
+        fun markItemSuccess(context: Context) {
+            successCount++
+            TaskStore.appendLog(context, "第 ${currentIndex + 1} 条已发送（成功 $successCount 条）。")
+        }
+
+        fun markItemFailed(context: Context, reason: String) {
+            failCount++
+            TaskStore.appendLog(context, "第 ${currentIndex + 1} 条失败：$reason（失败 $failCount 条）。")
+        }
+
+        fun finishStatus(): String {
+            return if (failCount == 0) {
+                "任务结束：成功 $successCount 条，失败 0 条。"
+            } else {
+                "任务结束：成功 $successCount 条，失败 $failCount 条。失败的原因写在日志里，请先看日志再重发。"
             }
         }
     }
@@ -129,7 +160,7 @@ class AutomationService : AccessibilityService() {
             TaskStore.appendLog(context, "拿不到当前窗口（第 $attempts 次），重试…")
             if (attempts >= 3) {
                 attempts = 0
-                TaskStore.appendLog(context, "第 ${currentIndex + 1} 条跳过：打不开页面。")
+                markItemFailed(context, "打不开页面，拿不到窗口")
                 advance(context, task)
             } else {
                 scheduleStep(context, 3000L)
@@ -146,7 +177,7 @@ class AutomationService : AccessibilityService() {
                 handler.postDelayed({
                     val send = findSendButton(rootInActiveWindow ?: return@postDelayed)
                     if (send != null && send.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                        TaskStore.appendLog(context, "第 ${currentIndex + 1} 条已发送。")
+                        markItemSuccess(context)
                         attempts = 0
                         advance(context, task)
                     } else {
@@ -155,7 +186,7 @@ class AutomationService : AccessibilityService() {
                         attempts++
                         if (attempts >= 3) {
                             attempts = 0
-                            TaskStore.appendLog(context, "第 ${currentIndex + 1} 条发送失败，已跳过。")
+                            markItemFailed(context, "填了评论但找不到发送按钮")
                             advance(context, task)
                         } else scheduleStep(context, 3000L)
                     }
@@ -172,7 +203,7 @@ class AutomationService : AccessibilityService() {
             attempts++
             if (attempts >= 6) {
                 attempts = 0
-                TaskStore.appendLog(context, "第 ${currentIndex + 1} 条跳过：打不开评论框。")
+                markItemFailed(context, "打不开评论框")
                 advance(context, task)
             } else scheduleStep(context, 2500L)
             return
@@ -183,7 +214,7 @@ class AutomationService : AccessibilityService() {
         TaskStore.appendLog(context, "还没找到评论框（第 $attempts 次），再等一下…")
         if (attempts >= 3) {
             attempts = 0
-            TaskStore.appendLog(context, "第 ${currentIndex + 1} 条跳过：页面里没有评论入口。")
+            markItemFailed(context, "页面里没有评论入口")
             advance(context, task)
         } else scheduleStep(context, 3000L)
     }
@@ -194,7 +225,7 @@ class AutomationService : AccessibilityService() {
         phase = "open"
         if (currentIndex >= task.items.size) {
             running = false
-            lastStatus = "任务完成：${task.items.size} 条已处理"
+            lastStatus = finishStatus()
             TaskStore.appendLog(context, lastStatus)
             return
         }
