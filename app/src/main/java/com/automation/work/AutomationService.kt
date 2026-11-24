@@ -86,8 +86,15 @@ class AutomationService : AccessibilityService() {
             TaskStore.appendLog(context, lastStatus)
             if (!openVideoLink(context, item.link)) {
                 // 链接根本打不开：记失败、直接跳过，别傻等 10 秒再假装处理。
-                markItemFailed(context, "打不开链接")
-                advance(context, task)
+                // advance 是实例方法，伴生对象里不能直接调，走 instance。
+                instance?.failCurrentAndAdvance(context, task)
+                    ?: run {
+                        markItemFailed(context, "打不开链接")
+                        currentIndex++
+                        running = false
+                        lastStatus = finishStatus()
+                        TaskStore.appendLog(context, lastStatus)
+                    }
                 return
             }
             // 打开后由 onAccessibilityEvent 驱动下一步；同时设一个兜底定时器，
@@ -217,6 +224,12 @@ class AutomationService : AccessibilityService() {
             markItemFailed(context, "页面里没有评论入口")
             advance(context, task)
         } else scheduleStep(context, 3000L)
+    }
+
+    /** 供伴生对象调用：记一条失败并推进到下一条（advance 是实例方法）。 */
+    fun failCurrentAndAdvance(context: Context, task: CommentTask) {
+        markItemFailed(context, "打不开链接")
+        advance(context, task)
     }
 
     private fun advance(context: Context, task: CommentTask) {
