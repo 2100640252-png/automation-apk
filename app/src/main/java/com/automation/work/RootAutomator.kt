@@ -37,9 +37,15 @@ object RootAutomator {
     private val sendKeywords = listOf("发送", "发布", "Send", "Post", "发表")
 
     private fun runCmd(cmd: String): RootHelper.CmdResult {
-        // 有 Root 就用 Root 跑，没 Root 也试一次普通 shell（部分机型不用 Root 也能跑）。
-        val r = RootHelper.runAsRoot(cmd)
-        return if (r.exitCode == 0) r else RootHelper.runShell(cmd)
+        // 执行顺序：Root > Shizuku（无线调试，不用 Root）> 普通 shell。
+        // 哪一级通了就用哪一级，通不了就往下一级试，最后都通不了才报失败。
+        val root = RootHelper.runAsRoot(cmd)
+        if (root.exitCode == 0) return root
+        if (ShizukuHelper.isAvailable() && ShizukuHelper.isPermissionGranted()) {
+            val sz = ShizukuHelper.run(cmd)
+            if (sz.exitCode == 0) return sz
+        }
+        return RootHelper.runShell(cmd)
     }
 
     /** 读当前界面控件树。返回空列表表示读不到界面（原因写进日志由调用方处理）。 */
