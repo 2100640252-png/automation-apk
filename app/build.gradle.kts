@@ -69,7 +69,7 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.3.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.5")
     implementation("androidx.work:work-runtime-ktx:2.9.0")
-    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:api:12.1.0")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     debugImplementation("androidx.compose.ui:ui-tooling:1.7.2")
 }
