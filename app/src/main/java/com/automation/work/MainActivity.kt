@@ -207,6 +207,17 @@ class MainActivity : ComponentActivity() {
         permissionStatus = PermissionHelper.allStatus(this)
     }
 
+    fun startCalibration(platform: String, kind: String) {
+        val kindName = if (kind == PointStore.KIND_SEND) "发送点" else "评论点"
+        if (AutomationService.instance == null) {
+            taskStatus = "校准需要先开无障碍：去设置 > 无障碍开启“自动化屏幕控制”，再回来校准。"
+            return
+        }
+        AutomationService.startCalibration(this, platform, kind)
+        taskStatus = "校准浮窗已打开：切到$platform 视频页，把红色标记拖到${kindName}正中心，点保存点位。"
+        refreshLog()
+    }
+
     fun refreshLog() {
         logText = TaskStore.loadLog(this)
     }
@@ -551,6 +562,7 @@ fun AutomationApp(activity: MainActivity) {
                 Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("更新") })
                 Tab(selected = tab == 3, onClick = { tab = 3; activity.refreshPlatforms() }, text = { Text("平台") })
                 Tab(selected = tab == 4, onClick = { tab = 4; activity.runSelfCheck() }, text = { Text("Root") })
+                Tab(selected = tab == 5, onClick = { tab = 5 }, text = { Text("点位") })
             }
             Spacer(Modifier.height(12.dp))
 
@@ -837,6 +849,65 @@ fun AutomationApp(activity: MainActivity) {
                     Spacer(Modifier.height(8.dp))
                     Text(activity.taskStatus)
                     Text(activity.logText, modifier = Modifier.fillMaxWidth().height(140.dp).verticalScroll(rememberScrollState()))
+                }
+            } else if (tab == 5) {
+                // 点位页：每平台评论点、发送点由用户校准，软件按平台记住，评论时按位置真实点击。
+                var pointPlatform by remember { mutableStateOf("快手") }
+                var pointRefresh by remember { mutableStateOf(0) }
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Text("点位配置：评论点和发送点你来定，软件记住", style = MaterialTheme.typography.titleMedium)
+                    Spacer(Modifier.height(8.dp))
+                    Text("每个平台的评论键、发送键位置都不一样。选好平台，点校准，切到那个平台的视频页，把红色标记拖到按键正中心保存。以后评论就按你保存的位置点，不再靠猜。")
+                    Spacer(Modifier.height(8.dp))
+                    Text("选择平台：")
+                    platforms.chunked(4).forEach { row ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            row.forEach { p ->
+                                if (p == pointPlatform) {
+                                    Button(onClick = { pointPlatform = p }) { Text(p) }
+                                } else {
+                                    OutlinedButton(onClick = { pointPlatform = p }) { Text(p) }
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(4.dp))
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    // pointRefresh 变化时重读已保存点位
+                    key(pointRefresh) {
+                        Card(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                            Column(Modifier.padding(12.dp)) {
+                                Text("$pointPlatform 评论点：${PointStore.describe(activity, pointPlatform, PointStore.KIND_COMMENT)}", style = MaterialTheme.typography.titleSmall)
+                                Text("打开评论区的按键位置。")
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Button(onClick = { activity.startCalibration(pointPlatform, PointStore.KIND_COMMENT) }) { Text("校准评论点") }
+                                    OutlinedButton(onClick = {
+                                        PointStore.clear(activity, pointPlatform, PointStore.KIND_COMMENT)
+                                        pointRefresh++
+                                    }) { Text("清除") }
+                                }
+                            }
+                        }
+                        Card(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                            Column(Modifier.padding(12.dp)) {
+                                Text("$pointPlatform 发送点：${PointStore.describe(activity, pointPlatform, PointStore.KIND_SEND)}", style = MaterialTheme.typography.titleSmall)
+                                Text("填好评论后确认发送的按键位置（快手/抖音常是右下角图标）。")
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Button(onClick = { activity.startCalibration(pointPlatform, PointStore.KIND_SEND) }) { Text("校准发送点") }
+                                    OutlinedButton(onClick = {
+                                        PointStore.clear(activity, pointPlatform, PointStore.KIND_SEND)
+                                        pointRefresh++
+                                    }) { Text("清除") }
+                                }
+                            }
+                        }
+                    }
+                    OutlinedButton(onClick = { pointRefresh++ }, modifier = Modifier.fillMaxWidth()) { Text("刷新已保存点位") }
+                    Spacer(Modifier.height(8.dp))
+                    Text("校准方法：点校准后切到对应平台打开一个视频（校准发送点时先随便打开评论区、让发送键露出来），拖动红色标记，圆心对准按键中心，点保存点位。配好后评论任务会按这个位置真实点击，并验证评论有没有发出去。")
+                    Spacer(Modifier.height(8.dp))
+                    Text(activity.taskStatus)
+                    Text(activity.logText, modifier = Modifier.fillMaxWidth().height(120.dp).verticalScroll(rememberScrollState()))
                 }
             } else {
                 // 更新页：软件内更新，不用去网页下载、不用解压。
