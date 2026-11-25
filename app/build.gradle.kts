@@ -12,8 +12,8 @@ android {
         applicationId = "com.automation.work"
         minSdk = 26
         targetSdk = 34
-        versionCode = 11
-        versionName = "1.7.3"
+        versionCode = 12
+        versionName = "1.8.0"
     }
 
     // 固定签名（v1.4 新增）：用同一把签名钥匙签每一个 Release 包，
