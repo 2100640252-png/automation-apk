@@ -37,6 +37,7 @@ class MainActivity : ComponentActivity() {
     var shizukuRunning by mutableStateOf(false)
     var shizukuGranted by mutableStateOf(false)
     var accessibilityOn by mutableStateOf(false)
+    var startupError by mutableStateOf("")
     var updateInfo: UpdateChecker.UpdateInfo? by mutableStateOf(null)
     var githubToken by mutableStateOf("")
 
@@ -52,24 +53,40 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Shizuku 授权结果回来就刷新自检状态。
-        try {
+        // 启动容错（v1.7.2）：每一步单独兜底，任何一步出错都不许闪退，
+        // 错误写到界面最上方，用户截图就能定位。
+        val errors = mutableListOf<String>()
+        fun step(name: String, block: () -> Unit) {
+            try {
+                block()
+            } catch (e: Exception) {
+                errors.add("$name：${e.javaClass.simpleName} ${e.message}")
+            }
+        }
+        step("Shizuku 监听") {
             rikka.shizuku.Shizuku.addRequestPermissionResultListener { _, _ ->
                 refreshSetupState()
                 runSelfCheck()
             }
-        } catch (e: Exception) {
         }
-        githubToken = TaskStore.loadGithubToken(this)
-        refreshVideos()
-        refreshPermissions()
-        refreshLog()
-        refreshPlatforms()
-        myPublishedLinks = TaskStore.loadMyPublishedLinks(this)
-        refreshSetupState()
-        // 启动就主动索取权限：这是 v1.0 打开没反应的直接原因，v1.1 改成一打开就申请。
-        permissionLauncher.launch(PermissionHelper.runtimePermissions.toTypedArray())
+        step("读取设置") { githubToken = TaskStore.loadGithubToken(this) }
+        step("读取视频库") { refreshVideos() }
+        step("读取权限状态") { refreshPermissions() }
+        step("读取日志") { refreshLog() }
+        step("检测平台") { refreshPlatforms() }
+        step("读取已发布链接") { myPublishedLinks = TaskStore.loadMyPublishedLinks(this) }
+        step("检测 Shizuku 状态") { refreshSetupState() }
+        if (errors.isNotEmpty()) {
+            startupError = "启动时有步骤出错（软件已容错打开）：\n" + errors.joinToString("\n")
+        }
         setContent { AutomationApp(this) }
+        // 界面出来后再申请权限，避免启动瞬间被权限弹窗打断。
+        step("申请权限") {
+            permissionLauncher.launch(PermissionHelper.runtimePermissions.toTypedArray())
+        }
+        if (errors.isNotEmpty() && startupError.isBlank()) {
+            startupError = "启动时有步骤出错（软件已容错打开）：\n" + errors.joinToString("\n")
+        }
     }
 
     override fun onResume() {
@@ -295,15 +312,19 @@ class MainActivity : ComponentActivity() {
 
     /** 设置向导状态：Shizuku 装没装、启动没启动、授权没授权、无障碍开没开。 */
     fun refreshSetupState() {
-        shizukuInstalled = try {
-            packageManager.getPackageInfo("moe.shizuku.privileged.api", 0)
-            true
+        try {
+            shizukuInstalled = try {
+                packageManager.getPackageInfo("moe.shizuku.privileged.api", 0)
+                true
+            } catch (e: Exception) {
+                false
+            }
+            shizukuRunning = ShizukuHelper.isAvailable()
+            shizukuGranted = ShizukuHelper.isPermissionGranted()
+            accessibilityOn = PermissionHelper.isAccessibilityEnabled(this)
         } catch (e: Exception) {
-            false
+            // 检测本身出错也不能让软件打不开，状态保持原样即可。
         }
-        shizukuRunning = ShizukuHelper.isAvailable()
-        shizukuGranted = ShizukuHelper.isPermissionGranted()
-        accessibilityOn = PermissionHelper.isAccessibilityEnabled(this)
     }
 
     /** 打开 Shizuku App；没装就去下载页。 */
@@ -448,6 +469,15 @@ fun AutomationApp(activity: MainActivity) {
         }
     ) { padding ->
         Column(Modifier.padding(padding).padding(16.dp).fillMaxSize()) {
+            if (activity.startupError.isNotBlank()) {
+                Card(Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(activity.startupError)
+                        Text("把这段文字截图发给我，我按这个修。")
+                    }
+                }
+                Spacer(Modifier.height(12.dp))
+            }
             // 权限面板：一打开就索取，缺哪项直接显示、点一下就去开。
             if (missing.isNotEmpty()) {
                 Card(Modifier.fillMaxWidth()) {
