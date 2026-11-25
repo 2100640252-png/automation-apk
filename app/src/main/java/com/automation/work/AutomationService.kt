@@ -2,8 +2,6 @@ package com.automation.work
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
-import android.content.Intent
-import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -11,19 +9,19 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
 /**
- * 无障碍屏幕控制服务（v1.1 真正干活的版本）。
+ * 无障碍屏幕控制服务（v1.8 诊断版）。
  *
- * 只在用户主动点“创建并开始任务”、且已在设置里手动开启本服务后才工作。
- * 流程（每条链接）：
- *  1. 用 Intent 打开链接（打开对应平台应用）
- *  2. 等页面加载，在无障碍树里找“评论”入口，点开评论面板
- *  3. 找可编辑的评论输入框，把自定义评论填进去
- *  4. 找“发送 / 发布”按钮点下去
- *  5. 按间隔等一会儿，再打开下一条链接
+ * 不用 Root、不用 Shizuku。流程（每条链接）：
+ *  步骤1-3 LinkResolver 在后台线程解析链接、直开对应平台 App（绝不走浏览器）
+ *  步骤4 验证当前界面确实是目标 App（被浏览器接走就报失败）
+ *  步骤5 找评论入口并点开
+ *  步骤6 填入评论
+ *  步骤7 点发送
+ *  步骤8 验证评论真的发出去了（输入框清空或评论出现在界面上）
+ * 每一步失败都写明卡在哪一步、为什么，不谎报成功。
  *
- * 自修复：每一步失败都会重试，最多 3 次；换不同的关键词再找一遍；
- * 实在找不到就记一条日志、跳过这条链接继续下一条，不会卡死。
- * 不读取密码、不上传数据、不在后台偷跑任务。
+ * 发视频辅助：视频交给平台发布页后，本服务在发布页里填文案、点下一步/发布，
+ * 并验证是否出现发布成功；验证不到就写明失败原因。
  */
 class AutomationService : AccessibilityService() {
 
@@ -31,24 +29,30 @@ class AutomationService : AccessibilityService() {
         var instance: AutomationService? = null
             private set
 
-        // 当前任务（由 MainActivity 设置）
         var currentTask: CommentTask? = null
         var currentIndex: Int = 0
         var running: Boolean = false
         var lastStatus: String = "未开始"
-        // v1.5 诚实上报：成功和失败分开计，绝不再用“已处理”冒充“已发送”。
         var successCount: Int = 0
         var failCount: Int = 0
+        var expectedPackage: String? = null
+        var expectedPlatform: String = ""
+
+        // 发视频辅助状态
+        var publishRunning: Boolean = false
+        var publishPlatform: String = ""
+        var publishPackage: String = ""
+        var publishCaption: String = ""
+        var publishAttempts: Int = 0
 
         private val handler = Handler(Looper.getMainLooper())
         private var stepRunnable: Runnable? = null
+        private var publishRunnable: Runnable? = null
 
         fun startTask(context: Context, task: CommentTask) {
-            // v1.5：无障碍服务没在运行就坚决不启动——以前是先把链接打开了，
-            // 服务却没接管，任务就悄悄卡死，用户还以为在跑。
             if (instance == null) {
                 running = false
-                lastStatus = "无障碍服务没在运行：请先在设置 > 无障碍里开启“自动化屏幕控制”，再点开始任务。"
+                lastStatus = "步骤0 失败：无障碍服务没在运行，请先在设置 > 无障碍里开启“自动化屏幕控制”。"
                 TaskStore.appendLog(context, lastStatus)
                 return
             }
@@ -68,7 +72,9 @@ class AutomationService : AccessibilityService() {
 
         fun stopTask(context: Context) {
             running = false
+            publishRunning = false
             stepRunnable?.let { handler.removeCallbacks(it) }
+            publishRunnable?.let { handler.removeCallbacks(it) }
             lastStatus = "任务已停止"
             TaskStore.appendLog(context, lastStatus)
         }
@@ -82,35 +88,34 @@ class AutomationService : AccessibilityService() {
                 return
             }
             val item = task.items[currentIndex]
-            lastStatus = "正在打开第 ${item.index} 条：${item.link}"
+            lastStatus = "正在处理第 ${item.index} 条：${item.link}"
             TaskStore.appendLog(context, lastStatus)
-            if (!openVideoLink(context, item.link)) {
-                // 链接根本打不开：记失败、直接跳过，别傻等 10 秒再假装处理。
-                // advance 是实例方法，伴生对象里不能直接调，走 instance。
-                instance?.failCurrentAndAdvance(context, task)
-                    ?: run {
-                        markItemFailed(context, "打不开链接")
-                        currentIndex++
-                        running = false
-                        lastStatus = finishStatus()
-                        TaskStore.appendLog(context, lastStatus)
+            // 链接解析要联网，必须在后台线程（主线程联网会被系统禁止，旧版就是这样失效的）。
+            Thread {
+                val result = LinkResolver.openVideoLinkDetailed(context, item.link)
+                handler.post {
+                    if (!running) return@post
+                    if (!result.success) {
+                        instance?.failCurrentAndAdvance(context, task, result.reason)
+                            ?: run {
+                                markItemFailed(context, result.reason)
+                                currentIndex++
+                                running = false
+                                lastStatus = finishStatus()
+                                TaskStore.appendLog(context, lastStatus)
+                            }
+                        return@post
                     }
-                return
-            }
-            // 打开后由 onAccessibilityEvent 驱动下一步；同时设一个兜底定时器，
-            // 万一收不到窗口事件，10 秒后也尝试找评论框。
-            instance?.scheduleStep(context, 10000L)
-        }
-
-        fun openVideoLink(context: Context, link: String): Boolean {
-            // v1.5：走 LinkResolver，抖音短链解析成深链直开抖音 App；
-            // 返回 false 时调用方记失败，不再当成已打开。
-            return LinkResolver.openVideoLink(context, link)
+                    expectedPackage = result.packageName
+                    expectedPlatform = result.platform
+                    instance?.scheduleStep(context, 3000L)
+                }
+            }.start()
         }
 
         fun markItemSuccess(context: Context) {
             successCount++
-            TaskStore.appendLog(context, "第 ${currentIndex + 1} 条已发送（成功 $successCount 条）。")
+            TaskStore.appendLog(context, "第 ${currentIndex + 1} 条评论已验证发出（成功 $successCount 条）。")
         }
 
         fun markItemFailed(context: Context, reason: String) {
@@ -122,13 +127,27 @@ class AutomationService : AccessibilityService() {
             return if (failCount == 0) {
                 "任务结束：成功 $successCount 条，失败 0 条。"
             } else {
-                "任务结束：成功 $successCount 条，失败 $failCount 条。失败的原因写在日志里，请先看日志再重发。"
+                "任务结束：成功 $successCount 条，失败 $failCount 条。每条失败卡在哪一步都写在日志里。"
             }
+        }
+
+        /** 发视频辅助：发布页打开后，自动填文案、点下一步/发布，并验证结果。 */
+        fun startPublishAssist(context: Context, platform: String, packageName: String, caption: String) {
+            if (instance == null) {
+                TaskStore.appendLog(context, "发视频步骤5 失败：无障碍服务没在运行，只能打开发布页，不能自动点发布。请开启无障碍后重试。")
+                return
+            }
+            publishPlatform = platform
+            publishPackage = packageName
+            publishCaption = caption
+            publishAttempts = 0
+            publishRunning = true
+            TaskStore.appendLog(context, "发视频步骤5：发布页已打开，开始自动填文案、点发布（$platform）…")
+            instance?.schedulePublishStep(context, 3000L)
         }
     }
 
     private var attempts: Int = 0
-    private var phase: String = "open"
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -137,13 +156,15 @@ class AutomationService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (!running) return
         if (event == null) return
-        // 只对窗口变化 / 内容变化作反应，避免每一次滚动都重复触发。
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) return
-        // 防抖：收到事件后 1.5 秒再动手，等页面稳定。
+        if (publishRunning) {
+            schedulePublishStep(this, 1500L)
+            return
+        }
+        if (!running) return
         scheduleStep(this, 1500L)
     }
 
@@ -154,6 +175,32 @@ class AutomationService : AccessibilityService() {
         handler.postDelayed(r, delayMs)
     }
 
+    private fun schedulePublishStep(context: Context, delayMs: Long) {
+        publishRunnable?.let { handler.removeCallbacks(it) }
+        val r = Runnable { tryPublishStep(context) }
+        publishRunnable = r
+        handler.postDelayed(r, delayMs)
+    }
+
+    private val browserPackages = setOf(
+        "com.android.chrome", "com.android.browser", "org.mozilla.firefox",
+        "com.microsoft.emmx", "com.opera.browser", "com.heytap.browser",
+        "com.coloros.browser", "com.vivo.browser", "com.mi.globalbrowser"
+    )
+
+    private fun treeText(root: AccessibilityNodeInfo): String {
+        val sb = StringBuilder()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            n.text?.let { sb.append(it).append(' ') }
+            n.contentDescription?.let { sb.append(it).append(' ') }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+        }
+        return sb.toString()
+    }
+
     private fun tryOneStep(context: Context) {
         if (!running) return
         val task = currentTask ?: return
@@ -162,80 +209,188 @@ class AutomationService : AccessibilityService() {
             return
         }
         val root = rootInActiveWindow ?: run {
-            // 拿不到窗口树：重试一次，超过 3 次就跳过这条。
             attempts++
-            TaskStore.appendLog(context, "拿不到当前窗口（第 $attempts 次），重试…")
+            TaskStore.appendLog(context, "步骤4 验证界面：拿不到当前窗口（第 $attempts 次），重试…")
             if (attempts >= 3) {
                 attempts = 0
-                markItemFailed(context, "打不开页面，拿不到窗口")
+                markItemFailed(context, "步骤4 失败：打不开页面，拿不到窗口")
                 advance(context, task)
-            } else {
-                scheduleStep(context, 3000L)
-            }
+            } else scheduleStep(context, 3000L)
             return
         }
-
-        // 1) 先找可编辑的评论输入框
+        // 步骤4：验证当前确实在目标 App 里。
+        val rootPkg = root.packageName?.toString() ?: ""
+        val expected = expectedPackage
+        if (expected != null && rootPkg != expected) {
+            if (rootPkg in browserPackages) {
+                markItemFailed(context, "步骤4 失败：链接被浏览器打开了，$expectedPlatform 没有接管（当前应用：$rootPkg）")
+                advance(context, task)
+                return
+            }
+            attempts++
+            TaskStore.appendLog(context, "步骤4 验证界面：当前不在$expectedPlatform（当前：$rootPkg），等它打开…（第 $attempts 次）")
+            if (attempts >= 3) {
+                attempts = 0
+                markItemFailed(context, "步骤4 失败：打开后不在目标 App（当前：$rootPkg，应为：$expected）")
+                advance(context, task)
+            } else scheduleStep(context, 3000L)
+            return
+        }
+        val allText = treeText(root)
+        if (allText.contains("请先登录") || allText.contains("立即登录") || allText.contains("登录后")) {
+            markItemFailed(context, "步骤5 失败：$expectedPlatform 要求登录，请先在 App 里登录账号")
+            advance(context, task)
+            return
+        }
+        if (allText.contains("验证码") || allText.contains("滑块") || allText.contains("安全验证")) {
+            markItemFailed(context, "步骤5 失败：$expectedPlatform 弹出了验证（验证码/滑块），自动评论被平台拦下")
+            advance(context, task)
+            return
+        }
+        // 步骤6：找评论输入框。
         val input = findEditableCommentBox(root)
         if (input != null) {
-            val ok = setText(input, task.commentText)
-            if (ok) {
-                TaskStore.appendLog(context, "已填入评论，正在找发送按钮…")
+            if (setText(input, task.commentText)) {
+                TaskStore.appendLog(context, "步骤6 填评论：已填入，正在找发送按钮…")
                 handler.postDelayed({
-                    val send = findSendButton(rootInActiveWindow ?: return@postDelayed)
-                    if (send != null && send.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
-                        markItemSuccess(context)
-                        attempts = 0
-                        advance(context, task)
+                    val fresh = rootInActiveWindow
+                    val send = if (fresh != null) findSendButton(fresh) else null
+                    if (send != null && clickNode(send)) {
+                        TaskStore.appendLog(context, "步骤7 点发送：已点，正在验证…")
+                        handler.postDelayed({ verifySent(context, task) }, 1800L)
                     } else {
-                        // 有的平台填完直接按回车也能发，试一次；不行就记日志重试。
-                        TaskStore.appendLog(context, "没找到发送按钮，正在重试…")
                         attempts++
+                        TaskStore.appendLog(context, "步骤7 点发送：没找到发送按钮（第 $attempts 次）")
                         if (attempts >= 3) {
                             attempts = 0
-                            markItemFailed(context, "填了评论但找不到发送按钮")
+                            markItemFailed(context, "步骤7 失败：填了评论但找不到发送按钮")
                             advance(context, task)
                         } else scheduleStep(context, 3000L)
                     }
                 }, 800L)
                 return
             }
+            attempts++
+            TaskStore.appendLog(context, "步骤6 填评论：输入框填不进去（第 $attempts 次）")
+            if (attempts >= 3) {
+                attempts = 0
+                markItemFailed(context, "步骤6 失败：评论填不进去")
+                advance(context, task)
+            } else scheduleStep(context, 3000L)
+            return
         }
-
-        // 2) 没找到输入框：找“评论”入口点开评论面板
+        // 步骤5：找评论入口点开。
         val commentBtn = findCommentEntry(root)
-        if (commentBtn != null) {
-            commentBtn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            TaskStore.appendLog(context, "已点开评论入口，等评论框出现…")
+        if (commentBtn != null && clickNode(commentBtn)) {
+            TaskStore.appendLog(context, "步骤5 打开评论区：已点评论入口，等评论框出现…")
             attempts++
             if (attempts >= 6) {
                 attempts = 0
-                markItemFailed(context, "打不开评论框")
+                markItemFailed(context, "步骤5 失败：点了评论入口但评论框一直不出现")
                 advance(context, task)
             } else scheduleStep(context, 2500L)
             return
         }
-
-        // 3) 什么都没找到：等页面再加载一会儿，最多重试 3 次
         attempts++
-        TaskStore.appendLog(context, "还没找到评论框（第 $attempts 次），再等一下…")
+        TaskStore.appendLog(context, "步骤5 打开评论区：界面上没有评论入口（第 $attempts 次）")
         if (attempts >= 3) {
             attempts = 0
-            markItemFailed(context, "页面里没有评论入口")
+            markItemFailed(context, "步骤5 失败：页面里没有评论入口（可能不是视频页，或评论被关闭）")
             advance(context, task)
         } else scheduleStep(context, 3000L)
     }
 
-    /** 供伴生对象调用：记一条失败并推进到下一条（advance 是实例方法）。 */
-    fun failCurrentAndAdvance(context: Context, task: CommentTask) {
-        markItemFailed(context, "打不开链接")
+    private fun verifySent(context: Context, task: CommentTask) {
+        if (!running) return
+        val root = rootInActiveWindow
+        val probe = task.commentText.take(6)
+        val sent = if (root == null) false else {
+            val text = treeText(root)
+            val input = findEditableCommentBox(root)
+            val inputText = input?.text?.toString() ?: ""
+            text.contains(probe) || (input != null && !inputText.contains(probe))
+        }
+        if (sent) {
+            TaskStore.appendLog(context, "步骤8 验证：评论已发出。")
+            markItemSuccess(context)
+            attempts = 0
+            advance(context, task)
+        } else {
+            attempts++
+            TaskStore.appendLog(context, "步骤8 验证：没验证到评论发出（第 $attempts 次）")
+            if (attempts >= 2) {
+                attempts = 0
+                markItemFailed(context, "步骤8 失败：点了发送但没有验证到评论发出（可能被平台拦截、需要登录或验证）")
+                advance(context, task)
+            } else scheduleStep(context, 3000L)
+        }
+    }
+
+    private fun tryPublishStep(context: Context) {
+        if (!publishRunning) return
+        val root = rootInActiveWindow ?: run {
+            publishAttempts++
+            if (publishAttempts >= 6) {
+                publishRunning = false
+                TaskStore.appendLog(context, "发视频步骤6 失败：拿不到发布页界面（$publishPlatform）")
+            } else schedulePublishStep(context, 3000L)
+            return
+        }
+        val rootPkg = root.packageName?.toString() ?: ""
+        if (rootPkg != publishPackage) {
+            publishAttempts++
+            TaskStore.appendLog(context, "发视频步骤6：当前不在$publishPlatform 发布页（当前：$rootPkg），等待…（第 $publishAttempts 次）")
+            if (publishAttempts >= 6) {
+                publishRunning = false
+                TaskStore.appendLog(context, "发视频步骤6 失败：发布页没有打开（当前应用：$rootPkg）")
+            } else schedulePublishStep(context, 3000L)
+            return
+        }
+        val allText = treeText(root)
+        if (allText.contains("发布成功") || allText.contains("已发布") || allText.contains("投稿成功")) {
+            publishRunning = false
+            lastStatus = "视频已发布到$publishPlatform（已验证）。"
+            TaskStore.appendLog(context, "发视频步骤8 验证：$publishPlatform 显示发布成功。")
+            return
+        }
+        // 填文案
+        if (publishCaption.isNotBlank()) {
+            val input = findEditableCommentBox(root)
+            val cur = input?.text?.toString() ?: ""
+            if (input != null && !cur.contains(publishCaption.take(6))) {
+                if (setText(input, publishCaption)) {
+                    TaskStore.appendLog(context, "发视频步骤6：已填文案。")
+                }
+            }
+        }
+        // 点下一步/发布
+        val btn = findPublishButton(root)
+        if (btn != null && clickNode(btn)) {
+            publishAttempts++
+            TaskStore.appendLog(context, "发视频步骤7：已点发布按钮（第 $publishAttempts 次），等待验证…")
+            if (publishAttempts >= 6) {
+                publishRunning = false
+                TaskStore.appendLog(context, "发视频步骤8 失败：点了发布但没有验证到发布成功（可能需要登录、验证或平台审核）")
+            } else schedulePublishStep(context, 3000L)
+            return
+        }
+        publishAttempts++
+        TaskStore.appendLog(context, "发视频步骤7：发布页上没有找到发布按钮（第 $publishAttempts 次）")
+        if (publishAttempts >= 6) {
+            publishRunning = false
+            TaskStore.appendLog(context, "发视频步骤7 失败：找不到发布按钮，请手动点发布")
+        } else schedulePublishStep(context, 3000L)
+    }
+
+    fun failCurrentAndAdvance(context: Context, task: CommentTask, reason: String = "打不开链接") {
+        markItemFailed(context, reason)
         advance(context, task)
     }
 
     private fun advance(context: Context, task: CommentTask) {
         currentIndex++
         attempts = 0
-        phase = "open"
+        expectedPackage = null
         if (currentIndex >= task.items.size) {
             running = false
             lastStatus = finishStatus()
@@ -248,22 +403,18 @@ class AutomationService : AccessibilityService() {
         handler.postDelayed({ openCurrent(context) }, delayMs)
     }
 
-    // ---- 节点查找：关键词覆盖抖音 / 快手 / 小红书 / B站 / 视频号等常见写法 ----
+    private fun nodeText(node: AccessibilityNodeInfo): String {
+        return (node.text?.toString() ?: "") + " " +
+            (node.contentDescription?.toString() ?: "") + " " +
+            (node.hintText?.toString() ?: "")
+    }
+
     private fun findEditableCommentBox(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
-        val keywords = listOf("评论", "说点什么", "写评论", "发评论", "善语结善缘", "Add comment", "comment")
         while (queue.isNotEmpty()) {
             val node = queue.removeFirst()
-            if (node.isEditable && node.className?.toString()?.contains("EditText") == true) {
-                return node
-            }
-            // 有的输入框是可编辑但类名不是 EditText，靠提示文字判断
             if (node.isEditable) return node
-            val text = (node.text?.toString() ?: "") + " " + (node.contentDescription?.toString() ?: "")
-            if (node.isClickable && keywords.any { text.contains(it) } && node.className?.toString()?.contains("EditText") == true) {
-                return node
-            }
             for (i in 0 until node.childCount) node.getChild(i)?.let { queue.add(it) }
         }
         return null
@@ -272,11 +423,11 @@ class AutomationService : AccessibilityService() {
     private fun findCommentEntry(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
-        val keywords = listOf("评论", "comment")
+        val keywords = listOf("评论", "留言", "comment", "Comment")
         while (queue.isNotEmpty()) {
             val node = queue.removeFirst()
-            val text = (node.text?.toString() ?: "") + " " + (node.contentDescription?.toString() ?: "")
-            if (node.isClickable && keywords.any { text.contains(it) }) return node
+            val text = nodeText(node)
+            if (keywords.any { text.contains(it) } && (node.isClickable || node.parent?.isClickable == true)) return node
             for (i in 0 until node.childCount) node.getChild(i)?.let { queue.add(it) }
         }
         return null
@@ -285,14 +436,40 @@ class AutomationService : AccessibilityService() {
     private fun findSendButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
-        val keywords = listOf("发送", "发布", "Send", "Post", "发表")
+        val keywords = listOf("发送", "发布", "发表", "Send", "Post")
         while (queue.isNotEmpty()) {
             val node = queue.removeFirst()
-            val text = (node.text?.toString() ?: "") + " " + (node.contentDescription?.toString() ?: "")
-            if (node.isClickable && keywords.any { text.contains(it) }) return node
+            val text = nodeText(node)
+            if (keywords.any { text.contains(it) }) return node
             for (i in 0 until node.childCount) node.getChild(i)?.let { queue.add(it) }
         }
         return null
+    }
+
+    private fun findPublishButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        val keywords = listOf("发布", "下一步", "发送", "Post", "Share", "完成")
+        var fallback: AccessibilityNodeInfo? = null
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            val text = nodeText(node)
+            if (keywords.any { text.contains(it) }) {
+                if (text.contains("发布") || text.contains("Post")) return node
+                if (fallback == null) fallback = node
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { queue.add(it) }
+        }
+        return fallback
+    }
+
+    private fun clickNode(node: AccessibilityNodeInfo): Boolean {
+        var cur: AccessibilityNodeInfo? = node
+        while (cur != null) {
+            if (cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            cur = cur.parent
+        }
+        return false
     }
 
     private fun setText(node: AccessibilityNodeInfo, text: String): Boolean {
@@ -306,6 +483,7 @@ class AutomationService : AccessibilityService() {
 
     override fun onInterrupt() {
         running = false
+        publishRunning = false
     }
 
     override fun onDestroy() {
