@@ -70,6 +70,9 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.5")
     implementation("androidx.work:work-runtime-ktx:2.9.0")
     implementation("dev.rikka.shizuku:api:12.1.0")
+    // ShizukuProvider 单独在这个包里：Manifest 声明的 rikka.shizuku.ShizukuProvider
+    // 必须有它，App 启动时系统才会初始化 Shizuku；缺了它一点开就闪退（v1.7.0 的 bug）。
+    implementation("dev.rikka.shizuku:provider:12.1.0")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     debugImplementation("androidx.compose.ui:ui-tooling:1.7.2")
 }
