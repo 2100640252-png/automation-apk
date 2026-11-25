@@ -95,6 +95,20 @@ class AutomationService : AccessibilityService() {
             svc.showCalibration(platform, kind)
         }
 
+        /** 点位预览悬浮窗：把已保存点位直接显示在平台界面上核对位置。 */
+        fun startPointPreview(context: Context, platform: String) {
+            val svc = instance
+            if (svc == null) {
+                TaskStore.appendLog(context, "悬浮窗失败：无障碍服务没在运行，请先开启无障碍。")
+                return
+            }
+            svc.showPointPreview(platform)
+        }
+
+        fun hidePointPreview() {
+            instance?.removeCalibration()
+        }
+
         fun stopTask(context: Context) {
             running = false
             publishRunning = false
@@ -616,87 +630,166 @@ class AutomationService : AccessibilityService() {
 
     private var calibrationRoot: FrameLayout? = null
 
-    /** 红色十字标记：圆心就是要保存的点击位置。 */
-    private inner class MarkerView(context: Context) : View(context) {
-        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    /** 全屏十字线：横线竖线贯穿全屏，圆心就是要保存的点击位置，拖动任意处移动。 */
+    private inner class CrosshairView(context: Context, private val labelText: String) : View(context) {
+        var cx: Float = 0f
+        var cy: Float = 0f
+        private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.RED
             style = Paint.Style.STROKE
-            strokeWidth = 6f
+            strokeWidth = 4f
         }
         private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.RED
             style = Paint.Style.FILL
         }
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.RED
+            textSize = 44f
+            isFakeBoldText = true
+        }
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
-            val cx = width / 2f
-            val cy = height / 2f
-            val r = minOf(width, height) / 2f - 8f
-            canvas.drawCircle(cx, cy, r, paint)
-            canvas.drawLine(cx - r, cy, cx + r, cy, paint)
-            canvas.drawLine(cx, cy - r, cx, cy + r, paint)
-            canvas.drawCircle(cx, cy, 8f, dotPaint)
+            canvas.drawLine(0f, cy, width.toFloat(), cy, linePaint)
+            canvas.drawLine(cx, 0f, cx, height.toFloat(), linePaint)
+            canvas.drawCircle(cx, cy, 70f, linePaint)
+            canvas.drawCircle(cx, cy, 10f, dotPaint)
+            canvas.drawText(labelText, (cx + 84f).coerceAtMost(width - 260f), (cy - 84f).coerceAtLeast(60f), textPaint)
         }
+    }
+
+    /** 双点位预览：评论点（绿）和发送点（红）同时显示在悬浮窗里，拖动哪个就保存哪个。 */
+    private inner class PreviewView(context: Context, private val platform: String) : View(context) {
+        private val dm = resources.displayMetrics
+        private var commentX: Float? = PointStore.load(context, platform, PointStore.KIND_COMMENT)?.x?.times(dm.widthPixels)
+        private var commentY: Float? = PointStore.load(context, platform, PointStore.KIND_COMMENT)?.y?.times(dm.heightPixels)
+        private var sendX: Float? = PointStore.load(context, platform, PointStore.KIND_SEND)?.x?.times(dm.widthPixels)
+        private var sendY: Float? = PointStore.load(context, platform, PointStore.KIND_SEND)?.y?.times(dm.heightPixels)
+        private var dragging: String? = null
+
+        private fun paint(color: Int) = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            style = Paint.Style.STROKE
+            strokeWidth = 5f
+        }
+        private fun textPaint(color: Int) = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+            textSize = 46f
+            isFakeBoldText = true
+        }
+
+        private fun drawPoint(canvas: Canvas, x: Float?, y: Float?, color: Int, label: String) {
+            if (x == null || y == null) return
+            canvas.drawCircle(x, y, 66f, paint(color))
+            canvas.drawLine(x - 90f, y, x + 90f, y, paint(color))
+            canvas.drawLine(x, y - 90f, x, y + 90f, paint(color))
+            canvas.drawText(label, (x + 78f).coerceAtMost(width - 220f), (y - 78f).coerceAtLeast(60f), textPaint(color))
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            drawPoint(canvas, commentX, commentY, Color.GREEN, "评论点")
+            drawPoint(canvas, sendX, sendY, Color.RED, "发送点")
+            if (commentX == null && sendX == null) {
+                canvas.drawText("这个平台还没配点位", 60f, height / 2f, textPaint(Color.RED))
+            }
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    val dc = if (commentX != null && commentY != null)
+                        kotlin.math.hypot(event.x - commentX!!, event.y - commentY!!) else Float.MAX_VALUE
+                    val ds = if (sendX != null && sendY != null)
+                        kotlin.math.hypot(event.x - sendX!!, event.y - sendY!!) else Float.MAX_VALUE
+                    dragging = when {
+                        dc <= ds && dc < 220f -> PointStore.KIND_COMMENT
+                        ds < 220f -> PointStore.KIND_SEND
+                        else -> null
+                    }
+                    return true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    when (dragging) {
+                        PointStore.KIND_COMMENT -> { commentX = event.x; commentY = event.y }
+                        PointStore.KIND_SEND -> { sendX = event.x; sendY = event.y }
+                    }
+                    if (dragging != null) invalidate()
+                    return true
+                }
+                MotionEvent.ACTION_UP -> {
+                    val kind = dragging
+                    dragging = null
+                    if (kind != null && width > 0 && height > 0) {
+                        val fx = (if (kind == PointStore.KIND_COMMENT) commentX else sendX)!! / width
+                        val fy = (if (kind == PointStore.KIND_COMMENT) commentY else sendY)!! / height
+                        PointStore.save(this@AutomationService, platform, kind, fx, fy)
+                        val kindName = if (kind == PointStore.KIND_SEND) "发送点" else "评论点"
+                        TaskStore.appendLog(this@AutomationService, "点位已保存：$platform $kindName X ${(fx * 100).toInt()}% · Y ${(fy * 100).toInt()}%")
+                    }
+                    return true
+                }
+            }
+            return super.onTouchEvent(event)
+        }
+    }
+
+    private fun overlayParams() = WindowManager.LayoutParams(
+        WindowManager.LayoutParams.MATCH_PARENT,
+        WindowManager.LayoutParams.MATCH_PARENT,
+        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+        PixelFormat.TRANSLUCENT
+    ).apply { gravity = Gravity.TOP or Gravity.START }
+
+    private fun topBar(labelText: String, buttons: List<Button>): LinearLayout {
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.argb(210, 0, 0, 0))
+            setPadding(24, 16, 24, 16)
+        }
+        val label = TextView(this).apply {
+            text = labelText
+            setTextColor(Color.WHITE)
+            textSize = 14f
+        }
+        bar.addView(label, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        buttons.forEach { bar.addView(it) }
+        return bar
     }
 
     fun showCalibration(platform: String, kind: String) {
         removeCalibration()
         val wm = getSystemService(WindowManager::class.java) ?: return
-        val density = resources.displayMetrics.density
-        val markerSize = (84 * density).toInt()
         val root = FrameLayout(this)
         val kindName = if (kind == PointStore.KIND_SEND) "发送点" else "评论点"
-        val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.argb(200, 0, 0, 0))
-            setPadding(24, 16, 24, 16)
-        }
-        val label = TextView(this).apply {
-            text = "$platform $kindName：把红色标记拖到按键正中心，再点保存"
-            setTextColor(Color.WHITE)
-            textSize = 14f
-        }
-        val marker = MarkerView(this)
+        val cross = CrosshairView(this, kindName)
         val saved = PointStore.load(this, platform, kind)
-        val markerParams = FrameLayout.LayoutParams(markerSize, markerSize)
         root.post {
-            val fx = saved?.x ?: 0.5f
-            val fy = saved?.y ?: 0.5f
-            markerParams.leftMargin = (fx * root.width - markerSize / 2).toInt().coerceAtLeast(0)
-            markerParams.topMargin = (fy * root.height - markerSize / 2).toInt().coerceAtLeast(0)
-            marker.layoutParams = markerParams
+            cross.cx = (saved?.x ?: 0.5f) * root.width
+            cross.cy = (saved?.y ?: 0.5f) * root.height
+            cross.invalidate()
         }
-        var downX = 0f
-        var downY = 0f
-        var startLeft = 0
-        var startTop = 0
-        marker.setOnTouchListener { _, event ->
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    downX = event.rawX
-                    downY = event.rawY
-                    startLeft = markerParams.leftMargin
-                    startTop = markerParams.topMargin
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    markerParams.leftMargin = (startLeft + (event.rawX - downX)).toInt()
-                        .coerceIn(0, (root.width - markerSize).coerceAtLeast(0))
-                    markerParams.topMargin = (startTop + (event.rawY - downY)).toInt()
-                        .coerceIn(0, (root.height - markerSize).coerceAtLeast(0))
-                    marker.layoutParams = markerParams
-                    true
-                }
-                else -> true
+        cross.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_DOWN || event.action == MotionEvent.ACTION_MOVE) {
+                cross.cx = event.x.coerceIn(0f, root.width.toFloat())
+                cross.cy = event.y.coerceIn(0f, root.height.toFloat())
+                cross.invalidate()
             }
+            true
+        }
+        fun nudge(dx: Float, dy: Float) {
+            cross.cx = (cross.cx + dx).coerceIn(0f, root.width.toFloat())
+            cross.cy = (cross.cy + dy).coerceIn(0f, root.height.toFloat())
+            cross.invalidate()
         }
         val saveBtn = Button(this).apply {
             text = "保存点位"
             setOnClickListener {
                 if (root.width > 0 && root.height > 0) {
-                    val fx = (markerParams.leftMargin + markerSize / 2f) / root.width
-                    val fy = (markerParams.topMargin + markerSize / 2f) / root.height
+                    val fx = cross.cx / root.width
+                    val fy = cross.cy / root.height
                     PointStore.save(this@AutomationService, platform, kind, fx, fy)
                     TaskStore.appendLog(
                         this@AutomationService,
@@ -710,31 +803,51 @@ class AutomationService : AccessibilityService() {
             text = "取消"
             setOnClickListener { removeCalibration() }
         }
-        bar.addView(label, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        bar.addView(saveBtn)
-        bar.addView(cancelBtn)
-        root.addView(marker, markerParams)
-        root.addView(
-            bar,
-            FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP
-            )
-        )
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.START }
+        val bar = topBar("$platform $kindName：十字圆心对准按键中心", listOf(saveBtn, cancelBtn))
+        val nudgeBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.argb(180, 0, 0, 0))
+            setPadding(24, 8, 24, 8)
+        }
+        listOf("←" to (-6f to 0f), "→" to (6f to 0f), "↑" to (0f to -6f), "↓" to (0f to 6f)).forEach { (label, d) ->
+            nudgeBar.addView(Button(this).apply {
+                text = label
+                setOnClickListener { nudge(d.first, d.second) }
+            })
+        }
+        val bottom = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        bottom.addView(nudgeBar)
+        root.addView(cross, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        root.addView(bar, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+        root.addView(bottom, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
         try {
-            wm.addView(root, params)
+            wm.addView(root, overlayParams())
             calibrationRoot = root
-            TaskStore.appendLog(this, "校准已打开：$platform $kindName，切到 $platform 视频页，把红色标记拖到按键正中心点保存。")
+            TaskStore.appendLog(this, "校准悬浮窗已打开：$platform $kindName，切到 $platform 视频页，十字圆心对准按键中心点保存。")
         } catch (e: Exception) {
-            TaskStore.appendLog(this, "校准浮窗打开失败：${e.message}")
+            TaskStore.appendLog(this, "校准悬浮窗打开失败：${e.message}")
+        }
+    }
+
+    /** 点位预览悬浮窗：把已保存的评论点、发送点直接显示在平台界面上，拖动即可改。 */
+    fun showPointPreview(platform: String) {
+        removeCalibration()
+        val wm = getSystemService(WindowManager::class.java) ?: return
+        val root = FrameLayout(this)
+        val preview = PreviewView(this, platform)
+        val closeBtn = Button(this).apply {
+            text = "关闭悬浮窗"
+            setOnClickListener { removeCalibration() }
+        }
+        val bar = topBar("$platform 点位悬浮窗：绿=评论点 红=发送点，拖动可改", listOf(closeBtn))
+        root.addView(preview, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        root.addView(bar, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+        try {
+            wm.addView(root, overlayParams())
+            calibrationRoot = root
+            TaskStore.appendLog(this, "点位悬浮窗已打开：$platform，切到 $platform 视频页就能看到评论点和发送点对的位置。")
+        } catch (e: Exception) {
+            TaskStore.appendLog(this, "点位悬浮窗打开失败：${e.message}")
         }
     }
 
