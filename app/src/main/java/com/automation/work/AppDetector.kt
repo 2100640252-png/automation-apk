@@ -95,16 +95,35 @@ object AppDetector {
      * 并在日志里写清是“没装”还是“该平台不接系统分享”，绝不谎报已发。
      */
     fun publishVideo(context: Context, platform: String, videoPath: String, copyText: String): Boolean {
+        return publishVideoDetailed(context, platform, videoPath, copyText).first
+    }
+
+    /** 发视频逐步诊断版：返回 (是否已打开发布页, 原因)。 */
+    fun publishVideoDetailed(context: Context, platform: String, videoPath: String, copyText: String): Pair<Boolean, String> {
         val pkg = publishPackages[platform]
-            ?: return false.also {
-                TaskStore.appendLog(context, "发视频失败：不支持的平台 $platform")
+            ?: return false to "发视频步骤1 失败：不支持的平台 $platform".also {
+                TaskStore.appendLog(context, it)
             }
         return try {
             val file = File(videoPath)
             if (!file.exists() || file.length() == 0L) {
-                TaskStore.appendLog(context, "发视频失败：视频文件不存在或为空：${file.name}")
-                return false
+                val r = "发视频步骤1 失败：视频文件不存在或为空：${file.name}"
+                TaskStore.appendLog(context, r)
+                return false to r
             }
+            TaskStore.appendLog(context, "发视频步骤1 检查视频：${file.name} 正常")
+            val installed = try {
+                context.packageManager.getPackageInfo(pkg, 0)
+                true
+            } catch (e: Exception) {
+                false
+            }
+            if (!installed) {
+                val r = "发视频步骤2 失败：手机没装$platform，请先安装并登录"
+                TaskStore.appendLog(context, r)
+                return false to r
+            }
+            TaskStore.appendLog(context, "发视频步骤2 检查 App：$platform 已安装")
             val uri: Uri = FileProvider.getUriForFile(
                 context, context.packageName + ".fileprovider", file
             )
@@ -116,17 +135,19 @@ object AppDetector {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            // 先确认该平台真的能接这个分享，没人接就直接报失败，别假装发出去了。
             if (intent.resolveActivity(context.packageManager) == null) {
-                TaskStore.appendLog(context, "发视频失败：$platform 没有接系统视频分享的入口（可能没装，或该版本不支持），请手动打开 $platform 发布。")
-                return false
+                val r = "发视频步骤3 失败：$platform 不接系统视频分享（该版本没有分享入口），请手动打开 $platform 发布"
+                TaskStore.appendLog(context, r)
+                return false to r
             }
+            TaskStore.appendLog(context, "发视频步骤3 检查分享入口：$platform 能接视频分享")
             context.startActivity(intent)
-            TaskStore.appendLog(context, "已把视频交给 $platform 发布页：${file.name}，请在 $platform 里点发布确认。")
-            true
+            TaskStore.appendLog(context, "发视频步骤4：已打开 $platform 发布页，视频已选好。")
+            true to "已打开 $platform 发布页"
         } catch (e: Exception) {
-            TaskStore.appendLog(context, "发视频到 $platform 失败：${e.message}")
-            false
+            val r = "发视频失败：${e.message}"
+            TaskStore.appendLog(context, r)
+            false to r
         }
     }
 
