@@ -214,8 +214,23 @@ class MainActivity : ComponentActivity() {
             return
         }
         AutomationService.startCalibration(this, platform, kind)
-        taskStatus = "校准浮窗已打开：切到$platform 视频页，把红色标记拖到${kindName}正中心，点保存点位。"
+        taskStatus = "校准悬浮窗已打开：切到$platform 视频页，十字圆心对准${kindName}中心，点保存点位。"
         refreshLog()
+    }
+
+    fun showPointPreview(platform: String) {
+        if (AutomationService.instance == null) {
+            taskStatus = "悬浮窗需要先开无障碍：去设置 > 无障碍开启“自动化屏幕控制”。"
+            return
+        }
+        AutomationService.startPointPreview(this, platform)
+        taskStatus = "点位悬浮窗已打开：切到$platform 视频页，绿圈是评论点、红圈是发送点，拖动就能改位置。"
+        refreshLog()
+    }
+
+    fun hidePointPreview() {
+        AutomationService.hidePointPreview()
+        taskStatus = "点位悬浮窗已关闭。"
     }
 
     fun refreshLog() {
@@ -506,10 +521,14 @@ class MainActivity : ComponentActivity() {
 fun AutomationApp(activity: MainActivity) {
     var tab by remember { mutableStateOf(0) } // 0 视频，1 评论，2 更新
     var copyText by remember { mutableStateOf("") }
-    var commentText by remember { mutableStateOf("") }
-    var interval by remember { mutableStateOf("10") }
+    val savedInputs = remember { TaskStore.loadCommentInputs(activity) }
+    var commentText by remember { mutableStateOf(savedInputs.second) }
+    var interval by remember { mutableStateOf(savedInputs.third) }
     var minutesAfter by remember { mutableStateOf("10") }
-    val links = remember { mutableStateListOf<String>().apply { repeat(10) { add("") } } }
+    val links = remember { mutableStateListOf<String>().apply { addAll(savedInputs.first) } }
+    fun persistInputs() {
+        TaskStore.saveCommentInputs(activity, links.toList(), commentText, interval)
+    }
     val selectedPlatforms = remember { mutableStateListOf<String>() }
     var selectedVideoId by remember { mutableStateOf<String?>(null) }
     val parsed = remember(copyText) { if (copyText.isBlank()) null else CopyParser.parse(copyText) }
@@ -665,14 +684,14 @@ fun AutomationApp(activity: MainActivity) {
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = commentText,
-                    onValueChange = { commentText = it },
+                    onValueChange = { commentText = it; persistInputs() },
                     label = { Text("自定义评论内容（空白文本）") },
                     modifier = Modifier.fillMaxWidth().height(100.dp)
                 )
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
                     value = interval,
-                    onValueChange = { interval = it },
+                    onValueChange = { interval = it; persistInputs() },
                     label = { Text("发送间隔（秒）") },
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -681,7 +700,7 @@ fun AutomationApp(activity: MainActivity) {
                     items(10) { i ->
                         OutlinedTextField(
                             value = links[i],
-                            onValueChange = { links[i] = it },
+                            onValueChange = { links[i] = it; persistInputs() },
                             label = { Text("视频链接 ${i + 1}") },
                             modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
                         )
@@ -904,7 +923,12 @@ fun AutomationApp(activity: MainActivity) {
                     }
                     OutlinedButton(onClick = { pointRefresh++ }, modifier = Modifier.fillMaxWidth()) { Text("刷新已保存点位") }
                     Spacer(Modifier.height(8.dp))
-                    Text("校准方法：点校准后切到对应平台打开一个视频（校准发送点时先随便打开评论区、让发送键露出来），拖动红色标记，圆心对准按键中心，点保存点位。配好后评论任务会按这个位置真实点击，并验证评论有没有发出去。")
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { activity.showPointPreview(pointPlatform) }, modifier = Modifier.weight(1f)) { Text("显示点位悬浮窗") }
+                        OutlinedButton(onClick = { activity.hidePointPreview() }, modifier = Modifier.weight(1f)) { Text("关闭悬浮窗") }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text("校准方法：点校准后切到对应平台打开一个视频（校准发送点时先打开评论区、让发送键露出来），悬浮窗十字圆心对准按键中心，可用底部箭头微调，点保存点位。点“显示点位悬浮窗”能直接在平台界面上看到评论点和发送点对的位置，拖动就能改。配好后评论任务按这个位置真实点击，并验证评论有没有发出去。")
                     Spacer(Modifier.height(8.dp))
                     Text(activity.taskStatus)
                     Text(activity.logText, modifier = Modifier.fillMaxWidth().height(120.dp).verticalScroll(rememberScrollState()))
