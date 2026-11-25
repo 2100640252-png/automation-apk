@@ -147,4 +147,41 @@ object TaskStore {
         return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getString(KEY_COMMENT_TASK, null)
     }
+
+    // 评论页输入（10 条链接 + 评论内容 + 间隔）：每次输入就存，关软件/更新都不丢。
+    private const val KEY_COMMENT_INPUTS = "comment_inputs_json"
+
+    fun saveCommentInputs(context: Context, links: List<String>, text: String, interval: String) {
+        val o = JSONObject()
+        val arr = JSONArray()
+        for (l in links) arr.put(l)
+        o.put("links", arr)
+        o.put("text", text)
+        o.put("interval", interval)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_COMMENT_INPUTS, o.toString()).apply()
+    }
+
+    fun loadCommentInputs(context: Context): Triple<List<String>, String, String> {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val raw = prefs.getString(KEY_COMMENT_INPUTS, null)
+        if (raw != null) {
+            try {
+                val o = JSONObject(raw)
+                val arr = o.optJSONArray("links") ?: JSONArray()
+                val links = (0 until 10).map { i -> if (i < arr.length()) arr.optString(i) else "" }
+                return Triple(links, o.optString("text", ""), o.optString("interval", "10"))
+            } catch (e: Exception) {
+            }
+        }
+        // 旧版没存输入时，从上次开始任务时保存的记录里恢复链接和评论。
+        val task = loadCommentTask(context)
+        if (task != null && task.contains("\n---\n")) {
+            val parts = task.split("\n---\n", limit = 2)
+            val saved = parts[0].split("\n").filter { it.isNotBlank() }
+            val links = (0 until 10).map { i -> saved.getOrElse(i) { "" } }
+            return Triple(links, parts.getOrElse(1) { "" }, "10")
+        }
+        return Triple(List(10) { "" }, "", "10")
+    }
 }
