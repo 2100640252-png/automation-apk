@@ -330,7 +330,7 @@ class AutomationService : AccessibilityService() {
             return
         }
         // 发送键没找到时，试回车发送（部分平台回车即发送）。
-        if (input != null && input.performAction(AccessibilityNodeInfo.ACTION_IME_ENTER)) {
+        if (input != null && input.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)) {
             TaskStore.appendLog(context, "步骤7 点发送：没找到发送键，已用回车发送，正在验证…")
             handler.postDelayed({ verifySent(context, task) }, 1800L)
             return
