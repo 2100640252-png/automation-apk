@@ -1,13 +1,27 @@
 package com.automation.work
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
 import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.Button
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.TextView
 
 /**
  * 无障碍屏幕控制服务（v1.8 诊断版）。
@@ -69,6 +83,16 @@ class AutomationService : AccessibilityService() {
                 task.items.joinToString("\n") { it.link } + "\n---\n" + task.commentText
             )
             openCurrent(context)
+        }
+
+        /** 点位校准：弹出可拖动标记，用户把标记拖到评论键/发送键正中心保存。 */
+        fun startCalibration(context: Context, platform: String, kind: String) {
+            val svc = instance
+            if (svc == null) {
+                TaskStore.appendLog(context, "校准失败：无障碍服务没在运行，请先在设置 > 无障碍里开启“自动化屏幕控制”。")
+                return
+            }
+            svc.showCalibration(platform, kind)
         }
 
         fun stopTask(context: Context) {
@@ -277,6 +301,18 @@ class AutomationService : AccessibilityService() {
             }, 700L)
             return
         }
+        // 用户配置了评论点就按保存位置真实点击打开评论区（每个平台位置不同，按平台记忆）。
+        val commentPoint = PointStore.load(context, expectedPlatform, PointStore.KIND_COMMENT)
+        if (commentPoint != null) {
+            tapAtFraction(commentPoint.x, commentPoint.y, "步骤5 打开评论区")
+            attempts++
+            if (attempts >= 6) {
+                attempts = 0
+                markItemFailed(context, "步骤5 失败：按配置评论点点了但评论框一直不出现（点位可能偏了，去点位页重新校准）")
+                advance(context, task)
+            } else scheduleStep(context, 2500L)
+            return
+        }
         // 输入框还没变成可编辑时，评论区底部常是一个“说点什么”占位，先点它。
         val placeholder = findPlaceholderInput(root)
         if (placeholder != null && clickNode(placeholder)) {
@@ -322,6 +358,13 @@ class AutomationService : AccessibilityService() {
             } else scheduleStep(context, 3000L)
             return
         }
+        // 用户配置了发送点就按保存位置真实点击（优先于自动找键，每个平台按记忆位置点）。
+        val sendPoint = PointStore.load(context, expectedPlatform, PointStore.KIND_SEND)
+        if (sendPoint != null) {
+            tapAtFraction(sendPoint.x, sendPoint.y, "步骤7 点发送")
+            handler.postDelayed({ verifySent(context, task) }, 1800L)
+            return
+        }
         val input = findEditableCommentBox(root)
         val found = findSendButton(root, input)
         if (found != null && clickNode(found.first)) {
@@ -339,7 +382,7 @@ class AutomationService : AccessibilityService() {
         TaskStore.appendLog(context, "步骤7 点发送：发送键没找到（文字和右下角位置都没找到，第 $attempts 次）")
         if (attempts >= 3) {
             attempts = 0
-            markItemFailed(context, "步骤7 失败：找不到发送键（快手/抖音发送键可能是图标，已按右下角位置找过仍没有）")
+            markItemFailed(context, "步骤7 失败：找不到发送键（快手/抖音发送键可能是图标，已按右下角位置找过仍没有；去点位页校准发送点后按位置点）")
             advance(context, task)
         } else scheduleStep(context, 3000L)
     }
@@ -569,12 +612,168 @@ class AutomationService : AccessibilityService() {
         return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
     }
 
+    // ---------- 点位校准浮窗与坐标点击 ----------
+
+    private var calibrationRoot: FrameLayout? = null
+
+    /** 红色十字标记：圆心就是要保存的点击位置。 */
+    private inner class MarkerView(context: Context) : View(context) {
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.RED
+            style = Paint.Style.STROKE
+            strokeWidth = 6f
+        }
+        private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.RED
+            style = Paint.Style.FILL
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val cx = width / 2f
+            val cy = height / 2f
+            val r = minOf(width, height) / 2f - 8f
+            canvas.drawCircle(cx, cy, r, paint)
+            canvas.drawLine(cx - r, cy, cx + r, cy, paint)
+            canvas.drawLine(cx, cy - r, cx, cy + r, paint)
+            canvas.drawCircle(cx, cy, 8f, dotPaint)
+        }
+    }
+
+    fun showCalibration(platform: String, kind: String) {
+        removeCalibration()
+        val wm = getSystemService(WindowManager::class.java) ?: return
+        val density = resources.displayMetrics.density
+        val markerSize = (84 * density).toInt()
+        val root = FrameLayout(this)
+        val kindName = if (kind == PointStore.KIND_SEND) "发送点" else "评论点"
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.argb(200, 0, 0, 0))
+            setPadding(24, 16, 24, 16)
+        }
+        val label = TextView(this).apply {
+            text = "$platform $kindName：把红色标记拖到按键正中心，再点保存"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+        }
+        val marker = MarkerView(this)
+        val saved = PointStore.load(this, platform, kind)
+        val markerParams = FrameLayout.LayoutParams(markerSize, markerSize)
+        root.post {
+            val fx = saved?.x ?: 0.5f
+            val fy = saved?.y ?: 0.5f
+            markerParams.leftMargin = (fx * root.width - markerSize / 2).toInt().coerceAtLeast(0)
+            markerParams.topMargin = (fy * root.height - markerSize / 2).toInt().coerceAtLeast(0)
+            marker.layoutParams = markerParams
+        }
+        var downX = 0f
+        var downY = 0f
+        var startLeft = 0
+        var startTop = 0
+        marker.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = event.rawX
+                    downY = event.rawY
+                    startLeft = markerParams.leftMargin
+                    startTop = markerParams.topMargin
+                    true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    markerParams.leftMargin = (startLeft + (event.rawX - downX)).toInt()
+                        .coerceIn(0, (root.width - markerSize).coerceAtLeast(0))
+                    markerParams.topMargin = (startTop + (event.rawY - downY)).toInt()
+                        .coerceIn(0, (root.height - markerSize).coerceAtLeast(0))
+                    marker.layoutParams = markerParams
+                    true
+                }
+                else -> true
+            }
+        }
+        val saveBtn = Button(this).apply {
+            text = "保存点位"
+            setOnClickListener {
+                if (root.width > 0 && root.height > 0) {
+                    val fx = (markerParams.leftMargin + markerSize / 2f) / root.width
+                    val fy = (markerParams.topMargin + markerSize / 2f) / root.height
+                    PointStore.save(this@AutomationService, platform, kind, fx, fy)
+                    TaskStore.appendLog(
+                        this@AutomationService,
+                        "点位已保存：$platform $kindName X ${(fx * 100).toInt()}% · Y ${(fy * 100).toInt()}%，以后评论按这个位置点。"
+                    )
+                }
+                removeCalibration()
+            }
+        }
+        val cancelBtn = Button(this).apply {
+            text = "取消"
+            setOnClickListener { removeCalibration() }
+        }
+        bar.addView(label, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        bar.addView(saveBtn)
+        bar.addView(cancelBtn)
+        root.addView(marker, markerParams)
+        root.addView(
+            bar,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP
+            )
+        )
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+        try {
+            wm.addView(root, params)
+            calibrationRoot = root
+            TaskStore.appendLog(this, "校准已打开：$platform $kindName，切到 $platform 视频页，把红色标记拖到按键正中心点保存。")
+        } catch (e: Exception) {
+            TaskStore.appendLog(this, "校准浮窗打开失败：${e.message}")
+        }
+    }
+
+    private fun removeCalibration() {
+        val root = calibrationRoot ?: return
+        calibrationRoot = null
+        try {
+            getSystemService(WindowManager::class.java)?.removeView(root)
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 按保存的屏幕比例真实点击一次（手势注入，点的是屏幕坐标）。 */
+    private fun tapAtFraction(x: Float, y: Float, label: String) {
+        val dm = resources.displayMetrics
+        val px = x * dm.widthPixels
+        val py = y * dm.heightPixels
+        val path = Path().apply { moveTo(px, py) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 60))
+            .build()
+        val ok = dispatchGesture(gesture, object : GestureResultCallback() {
+            override fun onCancelled(gestureDescription: GestureDescription?) {
+                TaskStore.appendLog(this@AutomationService, "$label：坐标点击被系统取消（X ${(x * 100).toInt()}% · Y ${(y * 100).toInt()}%）")
+            }
+        }, handler)
+        TaskStore.appendLog(
+            this,
+            "$label：已按配置点位点击（X ${(x * 100).toInt()}% · Y ${(y * 100).toInt()}%）${if (ok) "" else "，手势派发失败"}"
+        )
+    }
+
     override fun onInterrupt() {
         running = false
         publishRunning = false
     }
 
     override fun onDestroy() {
+        removeCalibration()
         super.onDestroy()
         instance = null
     }
