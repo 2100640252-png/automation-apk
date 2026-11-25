@@ -149,12 +149,17 @@ class MainActivity : ComponentActivity() {
         var ok = 0
         var fail = 0
         for (platform in platforms) {
-            if (AppDetector.publishVideo(this, platform, video.path, caption)) ok++ else fail++
+            val (opened, _) = AppDetector.publishVideoDetailed(this, platform, video.path, caption)
+            if (opened) {
+                ok++
+                val pkg = AppDetector.publishPackages[platform]
+                if (pkg != null) AutomationService.startPublishAssist(this, platform, pkg, caption)
+            } else fail++
         }
         taskStatus = if (fail == 0) {
-            "已把视频交给 ${platforms.joinToString("、")} 的发布页，请在各平台里点发布确认（共 $ok 个平台）。"
+            "已打开发布页并开始自动发布（共 $ok 个平台），结果看日志里的验证。"
         } else {
-            "发布结果：成功 $ok 个平台，失败 $fail 个平台。失败原因写在日志里，请先看日志。"
+            "发布结果：打开发布页 $ok 个平台，失败 $fail 个平台。失败卡在哪一步写在日志里。"
         }
         refreshLog()
     }
@@ -167,10 +172,13 @@ class MainActivity : ComponentActivity() {
             return
         }
         val caption = RandomContent.randomCaption()
-        if (AppDetector.publishVideo(this, platform, video.path, caption)) {
-            taskStatus = "已把随机视频交给 $platform 发布页：${video.name}，请在 $platform 里点发布确认。"
+        val (opened, reason) = AppDetector.publishVideoDetailed(this, platform, video.path, caption)
+        if (opened) {
+            val pkg = AppDetector.publishPackages[platform]
+            if (pkg != null) AutomationService.startPublishAssist(this, platform, pkg, caption)
+            taskStatus = "已打开 $platform 发布页并开始自动发布：${video.name}，结果看日志。"
         } else {
-            taskStatus = "发视频到 $platform 失败，原因写在日志里，请先看日志。"
+            taskStatus = "发视频到 $platform 失败：$reason"
         }
         refreshLog()
     }
@@ -286,6 +294,27 @@ class MainActivity : ComponentActivity() {
         AutomationService.stopTask(this)
         taskStatus = "任务已停止"
         refreshLog()
+    }
+
+    /** 只测试打开第一条链接（不评论）：用来定位链接卡在哪一步。 */
+    fun testOpenFirstLink(links: List<String>) {
+        val link = links.firstOrNull { it.isNotBlank() }
+        if (link == null) {
+            taskStatus = "请先填写至少 1 个视频链接。"
+            return
+        }
+        taskStatus = "正在测试打开链接：$link"
+        Thread {
+            val result = LinkResolver.openVideoLinkDetailed(this, link)
+            runOnUiThread {
+                taskStatus = if (result.success) {
+                    "测试打开成功：已用${result.method}打开${result.platform}。评论任务会接着找评论框。"
+                } else {
+                    "测试打开失败：${result.reason}"
+                }
+                refreshLog()
+            }
+        }.start()
     }
 
     /** 自动化引擎是否可用：Root 或 Shizuku 任一可用即可（v1.7.3 修复只认 Root 的拦截）。 */
@@ -661,6 +690,11 @@ fun AutomationApp(activity: MainActivity) {
                         modifier = Modifier.weight(1f)
                     ) { Text("停止任务") }
                 }
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = { activity.testOpenFirstLink(links.toList()) },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("只测试打开第一条链接（不评论）") }
                 Spacer(Modifier.height(8.dp))
                 Text(activity.taskStatus)
                 Text("运行日志（失败会写原因、自动重试）：", style = MaterialTheme.typography.titleSmall)
