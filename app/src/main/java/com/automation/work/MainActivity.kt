@@ -233,6 +233,57 @@ class MainActivity : ComponentActivity() {
         taskStatus = "点位悬浮窗已关闭。"
     }
 
+
+    fun openLinkOnly(link: String) {
+        if (link.isBlank()) { taskStatus = "先输入链接。"; return }
+        AutomationService.openLinkOnly(this, link.trim())
+        taskStatus = "正在打开链接…"
+        refreshLog()
+    }
+
+    fun startLinkComment(link: String, comment: String) {
+        if (link.isBlank()) { taskStatus = "先输入链接。"; return }
+        if (AutomationService.instance == null) {
+            taskStatus = "先开无障碍：去设置 > 无障碍开启“自动化屏幕控制”。"
+            PermissionHelper.openAccessibilitySettings(this)
+            return
+        }
+        AutomationService.startLinkComment(this, link.trim(), comment)
+        taskStatus = "正在打开链接并按记录的点击序列评论…"
+        refreshLog()
+    }
+
+    fun startRecorder(platform: String) {
+        if (AutomationService.instance == null) {
+            taskStatus = "记录点击需要无障碍，已打开无障碍设置，开启后回来再点。"
+            PermissionHelper.openAccessibilitySettings(this)
+            return
+        }
+        AutomationService.startRecorder(this, platform)
+        taskStatus = "记录悬浮窗已打开：切到$platform，按顺序点按键，点完按完成记录。"
+        refreshLog()
+    }
+
+    fun runSequence(platform: String, comment: String) {
+        if (AutomationService.instance == null) {
+            taskStatus = "先开无障碍再执行点击序列。"
+            PermissionHelper.openAccessibilitySettings(this)
+            return
+        }
+        AutomationService.runSequenceNow(this, platform, comment)
+        taskStatus = "正在按记录的点击序列真实点击…"
+        refreshLog()
+    }
+
+    fun publishVideoSimple(platform: String, caption: String) {
+        val video = videos.firstOrNull()
+        if (video == null) { taskStatus = "先选择一个视频。"; return }
+        val (ok, reason) = AppDetector.publishVideoDetailed(this, platform, video.path, caption)
+        taskStatus = reason
+        TaskStore.appendLog(this, "发视频：$reason")
+        refreshLog()
+    }
+
     fun refreshLog() {
         logText = TaskStore.loadLog(this)
     }
@@ -519,21 +570,20 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AutomationApp(activity: MainActivity) {
-    var tab by remember { mutableStateOf(0) } // 0 视频，1 评论，2 更新
-    var copyText by remember { mutableStateOf("") }
     val savedInputs = remember { TaskStore.loadCommentInputs(activity) }
+    var link by remember { mutableStateOf(savedInputs.first.firstOrNull { it.isNotBlank() } ?: "") }
     var commentText by remember { mutableStateOf(savedInputs.second) }
-    var interval by remember { mutableStateOf(savedInputs.third) }
-    var minutesAfter by remember { mutableStateOf("10") }
-    val links = remember { mutableStateListOf<String>().apply { addAll(savedInputs.first) } }
-    fun persistInputs() {
-        TaskStore.saveCommentInputs(activity, links.toList(), commentText, interval)
-    }
-    val selectedPlatforms = remember { mutableStateListOf<String>() }
-    var selectedVideoId by remember { mutableStateOf<String?>(null) }
-    val parsed = remember(copyText) { if (copyText.isBlank()) null else CopyParser.parse(copyText) }
+    var caption by remember { mutableStateOf("") }
+    var platform by remember { mutableStateOf("快手") }
+    var stepsRefresh by remember { mutableStateOf(0) }
+    var repeatText by remember { mutableStateOf(TapSequenceStore.loadRepeat(activity, platform).toString()) }
     val platforms = listOf("抖音", "快手", "小红书", "视频号", "哔哩哔哩", "TikTok", "YouTube", "微博")
     val missing = activity.permissionStatus.filter { !it.granted }
+
+    fun persist() {
+        val links = listOf(link) + savedInputs.first.drop(1)
+        TaskStore.saveCommentInputs(activity, links, commentText, savedInputs.third)
+    }
 
     Scaffold(
         topBar = {
@@ -545,17 +595,10 @@ fun AutomationApp(activity: MainActivity) {
             )
         }
     ) { padding ->
-        Column(Modifier.padding(padding).padding(16.dp).fillMaxSize()) {
-            if (activity.startupError.isNotBlank()) {
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(12.dp)) {
-                        Text(activity.startupError)
-                        Text("把这段文字截图发给我，我按这个修。")
-                    }
-                }
-                Spacer(Modifier.height(12.dp))
-            }
-            // 权限面板：一打开就索取，缺哪项直接显示、点一下就去开。
+        Column(
+            Modifier.padding(padding).padding(16.dp).fillMaxSize()
+                .verticalScroll(rememberScrollState())
+        ) {
             if (missing.isNotEmpty()) {
                 Card(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(12.dp)) {
@@ -569,393 +612,153 @@ fun AutomationApp(activity: MainActivity) {
                                 }) { Text("去开启") }
                             }
                         }
-                        TextButton(onClick = { activity.requestPermissions() }) { Text("重新申请全部运行时权限") }
                     }
                 }
                 Spacer(Modifier.height(12.dp))
             }
 
-            TabRow(selectedTabIndex = tab) {
-                Tab(selected = tab == 0, onClick = { tab = 0 }, text = { Text("视频版") })
-                Tab(selected = tab == 1, onClick = { tab = 1 }, text = { Text("评论版") })
-                Tab(selected = tab == 2, onClick = { tab = 2 }, text = { Text("更新") })
-                Tab(selected = tab == 3, onClick = { tab = 3; activity.refreshPlatforms() }, text = { Text("平台") })
-                Tab(selected = tab == 4, onClick = { tab = 4; activity.runSelfCheck() }, text = { Text("Root") })
-                Tab(selected = tab == 5, onClick = { tab = 5 }, text = { Text("点位") })
+            Text("链接", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = link,
+                onValueChange = { link = it; persist() },
+                label = { Text("视频链接（输入后一直保存）") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = commentText,
+                onValueChange = { commentText = it; persist() },
+                label = { Text("评论内容") },
+                modifier = Modifier.fillMaxWidth().height(90.dp)
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { activity.openLinkOnly(link) }, modifier = Modifier.weight(1f)) { Text("打开链接") }
+                Button(onClick = { activity.startLinkComment(link, commentText) }, modifier = Modifier.weight(1f)) { Text("开始评论") }
+                OutlinedButton(onClick = { activity.stopCommentTask() }, modifier = Modifier.weight(1f)) { Text("停止") }
             }
-            Spacer(Modifier.height(12.dp))
 
-            if (tab == 0) {
-                Column(Modifier.verticalScroll(rememberScrollState())) {
-                    Text("视频版：选视频、存进库、定时间按时发", style = MaterialTheme.typography.titleMedium)
-                    Spacer(Modifier.height(8.dp))
-                    Button(onClick = { activity.pickVideo() }, modifier = Modifier.fillMaxWidth()) {
-                        Text("选择视频（存进视频库）")
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    if (activity.videos.isEmpty()) {
-                        Text("视频库还是空的，点上面按钮选一个视频。")
-                    } else {
-                        activity.videos.forEach { v ->
-                            Card(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
-                                Column(Modifier.padding(10.dp)) {
-                                    Text("${v.name}（${v.sizeBytes / 1024} KB）")
-                                    Text("状态：${v.status}")
-                                    Row {
-                                        TextButton(onClick = { selectedVideoId = v.id }) {
-                                            Text(if (selectedVideoId == v.id) "已选中 ✓" else "选中这个视频")
-                                        }
-                                    }
-                                }
-                            }
+            Spacer(Modifier.height(16.dp))
+            Text("模拟真人器：你点哪里，软件记哪里", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
+            Text("选平台，点开始记录点击，切到平台按顺序点按键（评论键、输入框、发送键），软件记住每个位置。评论时按记录真实回放。")
+            Spacer(Modifier.height(8.dp))
+            platforms.chunked(4).forEach { row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    row.forEach { p ->
+                        if (p == platform) {
+                            Button(onClick = { platform = p; repeatText = TapSequenceStore.loadRepeat(activity, p).toString() }) { Text(p) }
+                        } else {
+                            OutlinedButton(onClick = { platform = p; repeatText = TapSequenceStore.loadRepeat(activity, p).toString() }) { Text(p) }
                         }
                     }
-                    Spacer(Modifier.height(8.dp))
-                    Text("要发的平台（可多选）：")
-                    platforms.chunked(4).forEach { row ->
-                        Row {
-                            row.forEach { p ->
-                                Row(Modifier.padding(end = 8.dp)) {
-                                    Checkbox(
-                                        checked = selectedPlatforms.contains(p),
-                                        onCheckedChange = {
-                                            if (it) selectedPlatforms.add(p) else selectedPlatforms.remove(p)
-                                        }
-                                    )
-                                    Text(p)
-                                }
-                            }
-                        }
-                    }
-                    OutlinedTextField(
-                        value = minutesAfter,
-                        onValueChange = { minutesAfter = it },
-                        label = { Text("几分钟后发布") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = copyText,
-                        onValueChange = { copyText = it },
-                        label = { Text("粘贴文案（正文 + #话题 + 声明）") },
-                        modifier = Modifier.fillMaxWidth().height(120.dp)
-                    )
-                    parsed?.let {
-                        Text("识别：正文：${it.body}")
-                        Text("话题：${it.topics.joinToString(" ") { t -> "#$t" }}")
-                        if (it.statement.isNotEmpty()) Text("声明：${it.statement}")
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Button(
-                        onClick = {
-                            val video = activity.videos.firstOrNull { it.id == selectedVideoId }
-                                ?: activity.videos.firstOrNull()
-                            if (video == null) {
-                                activity.taskStatus = "请先选择一个视频。"
-                            } else {
-                                val copy = parsed ?: CopyParser.parse(copyText)
-                                activity.publishNow(video, selectedPlatforms.toList(), copy)
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("立即发布这个视频（直交平台发布页）") }
-                    Spacer(Modifier.height(8.dp))
-                    Text("定时只是提醒：到时间发通知，点通知回来再一键发布，软件不能在后台悄悄替你发。")
-                    Button(
-                        onClick = {
-                            val video = activity.videos.firstOrNull { it.id == selectedVideoId }
-                                ?: activity.videos.firstOrNull()
-                            if (video == null) {
-                                activity.taskStatus = "请先选择一个视频。"
-                            } else {
-                                val copy = parsed ?: CopyParser.parse(copyText)
-                                activity.scheduleVideo(
-                                    video, selectedPlatforms.toList(),
-                                    minutesAfter.toIntOrNull() ?: 10, copy
-                                )
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("定时提醒这个视频") }
-                    Text(activity.taskStatus)
                 }
-            } else if (tab == 1) {
-                Text("评论版：一次最多 10 个链接", style = MaterialTheme.typography.titleMedium)
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = commentText,
-                    onValueChange = { commentText = it; persistInputs() },
-                    label = { Text("自定义评论内容（空白文本）") },
-                    modifier = Modifier.fillMaxWidth().height(100.dp)
-                )
-                Spacer(Modifier.height(8.dp))
-                OutlinedTextField(
-                    value = interval,
-                    onValueChange = { interval = it; persistInputs() },
-                    label = { Text("发送间隔（秒）") },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(8.dp))
-                LazyColumn(Modifier.weight(1f)) {
-                    items(10) { i ->
-                        OutlinedTextField(
-                            value = links[i],
-                            onValueChange = { links[i] = it; persistInputs() },
-                            label = { Text("视频链接 ${i + 1}") },
-                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
-                        )
-                    }
-                }
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(
-                        onClick = {
-                            activity.startCommentTask(
-                                links.toList(), commentText,
-                                interval.toIntOrNull() ?: 10
-                            )
-                        },
-                        modifier = Modifier.weight(1f)
-                    ) { Text("创建并开始任务") }
-                    OutlinedButton(
-                        onClick = { activity.stopCommentTask() },
-                        modifier = Modifier.weight(1f)
-                    ) { Text("停止任务") }
-                }
-                Spacer(Modifier.height(8.dp))
-                OutlinedButton(
-                    onClick = { activity.testOpenFirstLink(links.toList()) },
-                    modifier = Modifier.fillMaxWidth()
-                ) { Text("只测试打开第一条链接（不评论）") }
-                Spacer(Modifier.height(8.dp))
-                Text(activity.taskStatus)
-                Text("运行日志（失败会写原因、自动重试）：", style = MaterialTheme.typography.titleSmall)
-                Text(
-                    activity.logText,
-                    modifier = Modifier.fillMaxWidth().height(140.dp).verticalScroll(rememberScrollState())
-                )
-                TextButton(onClick = {
-                    TaskStore.clearLog(activity)
-                    activity.refreshLog()
-                }) { Text("清空日志") }
-            } else if (tab == 3) {
-                // 平台页：检测手机装了什么，直接打开；随机发布、随机评论测试。
-                var myLinksText by remember(activity.myPublishedLinks) { mutableStateOf(activity.myPublishedLinks.joinToString("\n")) }
-                Column(Modifier.verticalScroll(rememberScrollState())) {
-                    Text("平台检测：手机上装了什么，直接打开", style = MaterialTheme.typography.titleMedium)
-                    Spacer(Modifier.height(8.dp))
-                    TextButton(onClick = { activity.refreshPlatforms() }) { Text("重新检测") }
-                    activity.detectedPlatforms.forEach { p ->
-                        Card(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                Spacer(Modifier.height(4.dp))
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { activity.startRecorder(platform) }, modifier = Modifier.weight(1f)) { Text("开始记录点击") }
+                OutlinedButton(onClick = { activity.runSequence(platform, commentText) }, modifier = Modifier.weight(1f)) { Text("执行点击序列") }
+            }
+            Spacer(Modifier.height(8.dp))
+            key(stepsRefresh, platform) {
+                val steps = TapSequenceStore.loadSteps(activity, platform)
+                if (steps.isEmpty()) {
+                    Text("$platform 还没有记录点击。")
+                } else {
+                    steps.forEachIndexed { i, s ->
+                        Card(Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
                             Row(
                                 Modifier.fillMaxWidth().padding(10.dp),
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                Text("${p.name}：${if (p.installed) "已安装 ${p.versionName}" else "未安装"}")
-                                if (p.installed) {
-                                    Row {
-                                        TextButton(onClick = { activity.openPlatform(p.packageName) }) { Text("打开") }
-                                        TextButton(onClick = { activity.publishRandomVideoToPlatform(p.name) }) { Text("发视频") }
+                                Text(
+                                    if (s.type == TapSequenceStore.TYPE_FILL) "第 ${i + 1} 步：填入评论"
+                                    else "第 ${i + 1} 步：点击 X ${(s.x * 100).toInt()}% · Y ${(s.y * 100).toInt()}% · ${s.count} 次"
+                                )
+                                Row {
+                                    if (s.type == TapSequenceStore.TYPE_TAP) {
+                                        TextButton(onClick = {
+                                            val list = steps.toMutableList()
+                                            list[i] = s.copy(count = (s.count - 1).coerceAtLeast(1))
+                                            TapSequenceStore.saveSteps(activity, platform, list)
+                                            stepsRefresh++
+                                        }) { Text("次数-") }
+                                        TextButton(onClick = {
+                                            val list = steps.toMutableList()
+                                            list[i] = s.copy(count = s.count + 1)
+                                            TapSequenceStore.saveSteps(activity, platform, list)
+                                            stepsRefresh++
+                                        }) { Text("次数+") }
                                     }
+                                    TextButton(onClick = {
+                                        val list = steps.toMutableList()
+                                        list.removeAt(i)
+                                        TapSequenceStore.saveSteps(activity, platform, list)
+                                        stepsRefresh++
+                                    }) { Text("删除") }
                                 }
                             }
                         }
                     }
-                    Spacer(Modifier.height(8.dp))
-                    Text("抖音真实发布测试", style = MaterialTheme.typography.titleMedium)
-                    Text("从视频库随机挑一个视频，交给抖音发布页，文案随机，点发布前在抖音里确认。")
-                    Button(
-                        onClick = { activity.publishRandomVideoToDouyin() },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("随机发布一条视频到抖音") }
-                    Spacer(Modifier.height(12.dp))
-                    Text("随机评论到我已发布的视频", style = MaterialTheme.typography.titleMedium)
-                    Text("先把你抖音账号里已发布视频的链接贴下面，每行一条，保存后点随机评论，会随机挑一条、随机写一句评论去发。")
-                    OutlinedTextField(
-                        value = myLinksText,
-                        onValueChange = { myLinksText = it },
-                        label = { Text("我已发布的视频链接，每行一条") },
-                        modifier = Modifier.fillMaxWidth().height(120.dp)
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { activity.saveMyPublishedLinks(myLinksText) }) { Text("保存链接") }
-                        Button(onClick = { activity.commentRandomToMyVideo() }) { Text("随机评论一条") }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text(activity.taskStatus)
-                    Text(activity.logText, modifier = Modifier.fillMaxWidth().height(120.dp).verticalScroll(rememberScrollState()))
                 }
-            } else if (tab == 4) {
-                // Root 页：Root 自动化引擎 + 启动自检，逐项实测、不写假结果。
-                var rootLinksText by remember(activity.myPublishedLinks) { mutableStateOf(activity.myPublishedLinks.joinToString("\n")) }
-                var rootComment by remember { mutableStateOf("") }
-                Column(Modifier.verticalScroll(rememberScrollState())) {
-                    Text("Root 自动化：全程手机本地跑，不用接电脑", style = MaterialTheme.typography.titleMedium)
-                    Text("Root 就是开发者权限：有了它，软件自己在手机上跑系统命令（打开应用、读界面、点按屏幕），不用无障碍服务一直活着，也不用电脑。")
-                    Spacer(Modifier.height(8.dp))
-                    Text("引擎状态：${activity.rootStatus}")
-                    Card(Modifier.fillMaxWidth()) {
-                        Column(Modifier.padding(12.dp)) {
-                            Text("快速设置向导（按顺序点）", style = MaterialTheme.typography.titleSmall)
-                            val step1 = if (activity.shizukuInstalled) "已完成" else "未完成"
-                            val step2 = if (activity.shizukuRunning) "已完成" else "未完成"
-                            val step3 = if (activity.shizukuGranted) "已完成" else "未完成"
-                            val step4 = if (activity.accessibilityOn) "已完成" else "未完成"
-                            Text("第 1 步：安装 Shizuku —— $step1")
-                            if (!activity.shizukuInstalled) {
-                                Button(onClick = { activity.openShizukuDownload() }, modifier = Modifier.fillMaxWidth()) {
-                                    Text("去下载 Shizuku")
-                                }
-                            }
-                            Text("第 2 步：启动 Shizuku —— $step2")
-                            if (!activity.shizukuRunning) {
-                                Text("先去开发者选项打开“无线调试”，再打开 Shizuku，点“通过无线调试启动”，按提示配对。")
-                                Button(onClick = { activity.openDeveloperOptions() }, modifier = Modifier.fillMaxWidth()) {
-                                    Text("打开开发者选项")
-                                }
-                                Button(onClick = { activity.openShizukuApp() }, modifier = Modifier.fillMaxWidth()) {
-                                    Text("打开 Shizuku")
-                                }
-                            }
-                            Text("第 3 步：给本软件授权 —— $step3")
-                            if (!activity.shizukuGranted) {
-                                Button(onClick = { ShizukuHelper.requestPermission() }, modifier = Modifier.fillMaxWidth()) {
-                                    Text("申请 Shizuku 授权")
-                                }
-                            }
-                            Text("第 4 步：开无障碍（填中文评论要用） —— $step4")
-                            if (!activity.accessibilityOn) {
-                                Button(onClick = { PermissionHelper.openAccessibilitySettings(activity) }, modifier = Modifier.fillMaxWidth()) {
-                                    Text("去开启无障碍")
-                                }
-                            }
-                            if (activity.shizukuInstalled && activity.shizukuRunning && activity.shizukuGranted && activity.accessibilityOn) {
-                                Text("设置完成，可以开始 Root 自动化。")
-                            }
-                            OutlinedButton(onClick = {
-                                activity.refreshSetupState()
-                                activity.runSelfCheck()
-                            }, modifier = Modifier.fillMaxWidth()) {
-                                Text("重新检测")
-                            }
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Button(onClick = { activity.runSelfCheck() }, modifier = Modifier.fillMaxWidth()) {
-                        Text("运行启动自检")
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text(activity.selfCheckText)
-                    Spacer(Modifier.height(12.dp))
-                    Text("引擎测试", style = MaterialTheme.typography.titleMedium)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { activity.openDouyinByRoot() }) { Text("打开抖音") }
-                    }
-                    Spacer(Modifier.height(12.dp))
-                    Text("评论测试（Root/Shizuku）", style = MaterialTheme.typography.titleMedium)
-                    Text("用自动化引擎给已发布视频发评论（Root 或 Shizuku 都能跑）：先打开链接、读界面确认、点评论入口、填评论、点发送，每一步都验证，失败写原因。")
-                    OutlinedTextField(
-                        value = rootComment,
-                        onValueChange = { rootComment = it },
-                        label = { Text("评论内容") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Text("链接用平台页保存的已发布视频链接（${activity.myPublishedLinks.size} 条），没有就先去平台页保存。")
-                    Button(
-                        onClick = { activity.startRootCommentTask(activity.myPublishedLinks, rootComment, 10) },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("开始评论任务") }
-                    Spacer(Modifier.height(8.dp))
-                    Text(activity.taskStatus)
-                    Text(activity.logText, modifier = Modifier.fillMaxWidth().height(140.dp).verticalScroll(rememberScrollState()))
-                }
-            } else if (tab == 5) {
-                // 点位页：每平台评论点、发送点由用户校准，软件按平台记住，评论时按位置真实点击。
-                var pointPlatform by remember { mutableStateOf("快手") }
-                var pointRefresh by remember { mutableStateOf(0) }
-                Column(Modifier.verticalScroll(rememberScrollState())) {
-                    Text("点位配置：评论点和发送点你来定，软件记住", style = MaterialTheme.typography.titleMedium)
-                    Spacer(Modifier.height(8.dp))
-                    Text("每个平台的评论键、发送键位置都不一样。选好平台，点校准，切到那个平台的视频页，把红色标记拖到按键正中心保存。以后评论就按你保存的位置点，不再靠猜。")
-                    Spacer(Modifier.height(8.dp))
-                    Text("选择平台：")
-                    platforms.chunked(4).forEach { row ->
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            row.forEach { p ->
-                                if (p == pointPlatform) {
-                                    Button(onClick = { pointPlatform = p }) { Text(p) }
-                                } else {
-                                    OutlinedButton(onClick = { pointPlatform = p }) { Text(p) }
-                                }
-                            }
-                        }
-                        Spacer(Modifier.height(4.dp))
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    // pointRefresh 变化时重读已保存点位
-                    key(pointRefresh) {
-                        Card(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
-                            Column(Modifier.padding(12.dp)) {
-                                Text("$pointPlatform 评论点：${PointStore.describe(activity, pointPlatform, PointStore.KIND_COMMENT)}", style = MaterialTheme.typography.titleSmall)
-                                Text("打开评论区的按键位置。")
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Button(onClick = { activity.startCalibration(pointPlatform, PointStore.KIND_COMMENT) }) { Text("校准评论点") }
-                                    OutlinedButton(onClick = {
-                                        PointStore.clear(activity, pointPlatform, PointStore.KIND_COMMENT)
-                                        pointRefresh++
-                                    }) { Text("清除") }
-                                }
-                            }
-                        }
-                        Card(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
-                            Column(Modifier.padding(12.dp)) {
-                                Text("$pointPlatform 发送点：${PointStore.describe(activity, pointPlatform, PointStore.KIND_SEND)}", style = MaterialTheme.typography.titleSmall)
-                                Text("填好评论后确认发送的按键位置（快手/抖音常是右下角图标）。")
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    Button(onClick = { activity.startCalibration(pointPlatform, PointStore.KIND_SEND) }) { Text("校准发送点") }
-                                    OutlinedButton(onClick = {
-                                        PointStore.clear(activity, pointPlatform, PointStore.KIND_SEND)
-                                        pointRefresh++
-                                    }) { Text("清除") }
-                                }
-                            }
-                        }
-                    }
-                    OutlinedButton(onClick = { pointRefresh++ }, modifier = Modifier.fillMaxWidth()) { Text("刷新已保存点位") }
-                    Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { activity.showPointPreview(pointPlatform) }, modifier = Modifier.weight(1f)) { Text("显示点位悬浮窗") }
-                        OutlinedButton(onClick = { activity.hidePointPreview() }, modifier = Modifier.weight(1f)) { Text("关闭悬浮窗") }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text("校准方法：点校准后切到对应平台打开一个视频（校准发送点时先打开评论区、让发送键露出来），悬浮窗十字圆心对准按键中心，可用底部箭头微调，点保存点位。点“显示点位悬浮窗”能直接在平台界面上看到评论点和发送点对的位置，拖动就能改。配好后评论任务按这个位置真实点击，并验证评论有没有发出去。")
-                    Spacer(Modifier.height(8.dp))
-                    Text(activity.taskStatus)
-                    Text(activity.logText, modifier = Modifier.fillMaxWidth().height(120.dp).verticalScroll(rememberScrollState()))
-                }
-            } else {
-                // 更新页：软件内更新，不用去网页下载、不用解压。
-                Column(Modifier.verticalScroll(rememberScrollState())) {
-                    Text("软件内更新", style = MaterialTheme.typography.titleMedium)
-                    Spacer(Modifier.height(8.dp))
-                    Text("当前版本：v${UpdateChecker.currentVersionName(activity)}")
-                    Text("新版发布后，点“检查更新”，有新版直接在软件内下载安装，不用去网页、不用解压 zip。")
-                    Spacer(Modifier.height(8.dp))
-                    Text("不用填 Token，直接点“检查更新”就行。")
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { activity.checkUpdate() }) { Text("检查更新") }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text(activity.updateStatus)
-                    if (activity.updateInfo != null) {
-                        Spacer(Modifier.height(8.dp))
-                        Text("发现新版：${activity.updateInfo!!.tag} ${activity.updateInfo!!.name}")
-                        Button(onClick = { activity.downloadUpdate() }, modifier = Modifier.fillMaxWidth()) {
-                            Text("下载并安装新版")
-                        }
-                    }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = {
+                        val list = steps.toMutableList()
+                        list.add(TapSequenceStore.Step(TapSequenceStore.TYPE_FILL, 0f, 0f, 1))
+                        TapSequenceStore.saveSteps(activity, platform, list)
+                        stepsRefresh++
+                    }) { Text("加一步：填入评论") }
+                    OutlinedButton(onClick = { stepsRefresh++ }) { Text("刷新序列") }
                 }
             }
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = repeatText,
+                onValueChange = {
+                    repeatText = it
+                    TapSequenceStore.saveRepeat(activity, platform, it.toIntOrNull() ?: 1)
+                },
+                label = { Text("整套序列重复遍数") },
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            Spacer(Modifier.height(16.dp))
+            Text("发视频", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
+            Button(onClick = { activity.pickVideo() }, modifier = Modifier.fillMaxWidth()) { Text("选择视频") }
+            if (activity.videos.isEmpty()) {
+                Text("还没选视频。")
+            } else {
+                Text("已选：${activity.videos.first().name}")
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = caption,
+                onValueChange = { caption = it },
+                label = { Text("视频文案") },
+                modifier = Modifier.fillMaxWidth().height(80.dp)
+            )
+            Spacer(Modifier.height(8.dp))
+            Button(onClick = { activity.publishVideoSimple(platform, caption) }, modifier = Modifier.fillMaxWidth()) {
+                Text("发视频到$platform（打开发布页）")
+            }
+            Text("发布页打开后，可用上面的点击序列点发布。")
+
+            Spacer(Modifier.height(16.dp))
+            Text(activity.taskStatus)
+            if (activity.updateInfo != null) {
+                Spacer(Modifier.height(8.dp))
+                Text("发现新版：${activity.updateInfo!!.tag}")
+                Button(onClick = { activity.downloadUpdate() }, modifier = Modifier.fillMaxWidth()) { Text("下载并安装新版") }
+            }
+            Spacer(Modifier.height(8.dp))
+            Text("运行日志：", style = MaterialTheme.typography.titleSmall)
+            Text(activity.logText, modifier = Modifier.fillMaxWidth().height(160.dp).verticalScroll(rememberScrollState()))
+            TextButton(onClick = {
+                TaskStore.clearLog(activity)
+                activity.refreshLog()
+            }) { Text("清空日志") }
         }
     }
 }
