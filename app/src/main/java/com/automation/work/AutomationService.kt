@@ -109,6 +109,53 @@ class AutomationService : AccessibilityService() {
             instance?.removeCalibration()
         }
 
+
+        /** 只打开链接（不评论）：解析链接直达对应平台 App。 */
+        fun openLinkOnly(context: Context, link: String) {
+            Thread {
+                val result = LinkResolver.openVideoLinkDetailed(context, link)
+                TaskStore.appendLog(context, "打开链接：${result.reason}")
+            }.start()
+        }
+
+        /** 打开链接后按该平台记录的点击序列真实回放（模拟真人）。 */
+        fun startLinkComment(context: Context, link: String, comment: String) {
+            val svc = instance
+            if (svc == null) {
+                TaskStore.appendLog(context, "开始失败：无障碍服务没在运行，请先开启无障碍。")
+                return
+            }
+            Thread {
+                val result = LinkResolver.openVideoLinkDetailed(context, link)
+                handler.post {
+                    if (!result.success) {
+                        TaskStore.appendLog(context, "打开链接失败：${result.reason}")
+                        return@post
+                    }
+                    TaskStore.appendLog(context, "已打开${result.platform}，3 秒后按记录的点击序列执行…")
+                    handler.postDelayed({ svc.runSequence(result.platform, comment) }, 3000L)
+                }
+            }.start()
+        }
+
+        fun runSequenceNow(context: Context, platform: String, comment: String) {
+            val svc = instance
+            if (svc == null) {
+                TaskStore.appendLog(context, "执行失败：无障碍服务没在运行，请先开启无障碍。")
+                return
+            }
+            svc.runSequence(platform, comment)
+        }
+
+        fun startRecorder(context: Context, platform: String) {
+            val svc = instance
+            if (svc == null) {
+                TaskStore.appendLog(context, "记录失败：无障碍服务没在运行，请先开启无障碍。")
+                return
+            }
+            svc.showRecorder(platform)
+        }
+
         fun stopTask(context: Context) {
             running = false
             publishRunning = false
@@ -858,6 +905,140 @@ class AutomationService : AccessibilityService() {
             getSystemService(WindowManager::class.java)?.removeView(root)
         } catch (_: Exception) {
         }
+    }
+
+
+    // ---------- 模拟真人器：记录点击 + 真实回放 ----------
+
+    private inner class RecorderView(context: Context) : View(context) {
+        val points = mutableListOf<Pair<Float, Float>>()
+        private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.RED
+            style = Paint.Style.FILL
+        }
+        private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.RED
+            style = Paint.Style.STROKE
+            strokeWidth = 5f
+        }
+        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 40f
+            isFakeBoldText = true
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            points.forEachIndexed { i, pt ->
+                canvas.drawCircle(pt.first, pt.second, 46f, ringPaint)
+                canvas.drawCircle(pt.first, pt.second, 30f, dotPaint)
+                canvas.drawText("${i + 1}", pt.first - 12f, pt.second + 14f, textPaint)
+            }
+        }
+
+        override fun onTouchEvent(event: MotionEvent): Boolean {
+            if (event.action == MotionEvent.ACTION_UP) {
+                points.add(event.x to event.y)
+                invalidate()
+                TaskStore.appendLog(this@AutomationService, "已记录第 ${points.size} 个点击位置")
+            }
+            return true
+        }
+    }
+
+    fun showRecorder(platform: String) {
+        removeCalibration()
+        val wm = getSystemService(WindowManager::class.java) ?: return
+        val root = FrameLayout(this)
+        val recorder = RecorderView(this)
+        val doneBtn = Button(this).apply {
+            text = "完成记录"
+            setOnClickListener {
+                if (root.width > 0 && root.height > 0 && recorder.points.isNotEmpty()) {
+                    val steps = recorder.points.map { pt ->
+                        TapSequenceStore.Step(
+                            TapSequenceStore.TYPE_TAP,
+                            pt.first / root.width,
+                            pt.second / root.height,
+                            1
+                        )
+                    }
+                    TapSequenceStore.saveSteps(this@AutomationService, platform, steps)
+                    TaskStore.appendLog(this@AutomationService, "点击序列已保存：$platform 共 ${steps.size} 个点位，软件记住了。")
+                    android.widget.Toast.makeText(this@AutomationService, "$platform 已记住 ${steps.size} 个点位", android.widget.Toast.LENGTH_SHORT).show()
+                } else {
+                    TaskStore.appendLog(this@AutomationService, "记录取消：还没有点任何位置。")
+                }
+                removeCalibration()
+            }
+        }
+        val cancelBtn = Button(this).apply {
+            text = "取消"
+            setOnClickListener { removeCalibration() }
+        }
+        val bar = topBar("记录 $platform 点击：切到 $platform，按顺序点你要点的按键", listOf(doneBtn, cancelBtn))
+        root.addView(recorder, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        root.addView(bar, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+        try {
+            wm.addView(root, overlayParams())
+            calibrationRoot = root
+            android.widget.Toast.makeText(this, "记录悬浮窗已打开", android.widget.Toast.LENGTH_SHORT).show()
+            TaskStore.appendLog(this, "记录悬浮窗已打开：切到 $platform，按顺序点评论键、输入框、发送键，点完按完成记录。")
+        } catch (e: Exception) {
+            TaskStore.appendLog(this, "记录悬浮窗打开失败：${e.message}")
+            android.widget.Toast.makeText(this, "悬浮窗打开失败：${e.message}", android.widget.Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /** 按记录的序列真实回放：点位逐个点（每点按设置次数），填评论步填入并验证。 */
+    fun runSequence(platform: String, comment: String) {
+        val steps = TapSequenceStore.loadSteps(this, platform)
+        if (steps.isEmpty()) {
+            TaskStore.appendLog(this, "执行失败：$platform 还没有记录点击，先点“开始记录点击”把位置记下来。")
+            return
+        }
+        val repeat = TapSequenceStore.loadRepeat(this, platform)
+        TaskStore.appendLog(this, "开始执行 $platform 点击序列：${steps.size} 步，重复 $repeat 遍。")
+        execStep(platform, steps, comment, 1, repeat, 0)
+    }
+
+    private fun execStep(platform: String, steps: List<TapSequenceStore.Step>, comment: String, round: Int, repeat: Int, index: Int) {
+        if (index >= steps.size) {
+            if (round < repeat) {
+                TaskStore.appendLog(this, "第 $round 遍完成，继续第 ${round + 1} 遍…")
+                handler.postDelayed({ execStep(platform, steps, comment, round + 1, repeat, 0) }, 1200L)
+            } else {
+                TaskStore.appendLog(this, "点击序列执行完成（$platform，共 $repeat 遍）。")
+            }
+            return
+        }
+        val step = steps[index]
+        val nextDelay = 600L + kotlin.random.Random.nextLong(0, 500)
+        if (step.type == TapSequenceStore.TYPE_FILL) {
+            val root = rootInActiveWindow
+            val input = root?.let { findEditableCommentBox(it) }
+            if (input != null && setText(input, comment)) {
+                val probe = comment.take(6)
+                val verified = rootInActiveWindow?.let { findEditableCommentBox(it)?.text?.toString()?.contains(probe) } == true
+                TaskStore.appendLog(this, "第 ${index + 1} 步填评论：${if (verified) "已填入并验证" else "已填入，未验证到文字"}")
+            } else {
+                TaskStore.appendLog(this, "第 ${index + 1} 步填评论失败：找不到可填的输入框（先点输入框再填）")
+            }
+            handler.postDelayed({ execStep(platform, steps, comment, round, repeat, index + 1) }, nextDelay)
+            return
+        }
+        tapTimes(step, step.count) {
+            handler.postDelayed({ execStep(platform, steps, comment, round, repeat, index + 1) }, nextDelay)
+        }
+    }
+
+    private fun tapTimes(step: TapSequenceStore.Step, remaining: Int, done: () -> Unit) {
+        if (remaining <= 0) {
+            done()
+            return
+        }
+        tapAtFraction(step.x, step.y, "真实点击")
+        handler.postDelayed({ tapTimes(step, remaining - 1, done) }, 380L)
     }
 
     /** 按保存的屏幕比例真实点击一次（手势注入，点的是屏幕坐标）。 */
