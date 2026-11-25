@@ -11,6 +11,9 @@ import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
 
 /**
  * 软件内更新（v1.1 新增）：
@@ -87,17 +90,32 @@ object UpdateChecker {
                     handler.post { onResult(null, "最新版里没有找到 app-release.apk，请稍后重试。") }
                     return@Thread
                 }
-                // tag 形如 v1.1.8（1.1 是版本号，8 是构建号），只比较前两段：
-                // 相同大版本就当已是最新，避免每次构建号变化都重复提示；
-                // tag 的大版本更高时才提示更新。
+                // tag 形如 v1.9.66（1.9 是版本号，66 是构建号）。
+                // 大版本更高 -> 有更新；大版本相同 -> 比较发布时间和本机安装时间，
+                // 发布时间晚于安装时间才提示，避免装完还反复提示。
                 fun core(v: String): List<Int> {
                     return v.trimStart('v').split(".").take(2).map { it.toIntOrNull() ?: 0 }
                 }
+                fun newerCore(a: List<Int>, b: List<Int>): Boolean {
+                    val first = a.zip(b).firstOrNull { it.first != it.second }
+                    return first != null && first.first > first.second
+                }
                 val current = currentVersionName(context)
-                val tagCore = core(tag)
-                val curCore = core(current)
-                val cmp = tagCore.zip(curCore).firstOrNull { it.first != it.second }
-                if (cmp == null || cmp.first <= cmp.second) {
+                val publishedAt = try {
+                    val fmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US)
+                    fmt.timeZone = TimeZone.getTimeZone("UTC")
+                    fmt.parse(json.optString("published_at", ""))?.time ?: 0L
+                } catch (e: Exception) {
+                    0L
+                }
+                val installedAt = try {
+                    context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
+                } catch (e: Exception) {
+                    0L
+                }
+                val hasUpdate = newerCore(core(tag), core(current)) ||
+                    (publishedAt > 0L && installedAt > 0L && publishedAt > installedAt + 120_000L)
+                if (!hasUpdate) {
                     handler.post { onResult(null, "已经是最新版 v$current，无需更新。") }
                 } else {
                     handler.post { onResult(UpdateInfo(tag, name, apkUrl, size), "发现新版 $tag，可以在软件内直接下载安装。") }
