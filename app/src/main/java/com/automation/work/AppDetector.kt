@@ -44,7 +44,7 @@ object AppDetector {
                 val info = pm.getPackageInfo(pkg, 0)
                 installed = true
                 version = info.versionName ?: ""
-            } catch (e: PackageManager.NameNotFoundException) {
+            } catch (e: Exception) {
                 installed = false
             }
             PlatformApp(name, pkg, installed, version)
