@@ -288,13 +288,26 @@ class MainActivity : ComponentActivity() {
         refreshLog()
     }
 
+    /** 自动化引擎是否可用：Root 或 Shizuku 任一可用即可（v1.7.3 修复只认 Root 的拦截）。 */
+    fun engineAvailable(): Pair<Boolean, String> {
+        val (rootOk, rootMsg) = RootHelper.checkRoot()
+        if (rootOk) return true to "Root 可用"
+        val (szOk, szMsg) = ShizukuHelper.checkShizuku()
+        if (szOk) return true to "Shizuku 可用（不用 Root）"
+        return false to "Root 不可用：$rootMsg；Shizuku 不可用：$szMsg"
+    }
+
     /** 启动自检（v1.6）：逐项实测，逐项报通过或失败，不写假的“已完成”。 */
     fun runSelfCheck() {
         val lines = mutableListOf<String>()
         val (rootOk, rootMsg) = RootHelper.checkRoot()
-        rootStatus = if (rootOk) "已 Root" else "未 Root"
-        lines.add("Root 权限：${if (rootOk) "通过" else "不通过"}——$rootMsg")
         val (szOk, szMsg) = ShizukuHelper.checkShizuku()
+        rootStatus = when {
+            rootOk -> "已 Root"
+            szOk -> "未 Root · Shizuku 可用"
+            else -> "未 Root"
+        }
+        lines.add("Root 权限：${if (rootOk) "通过" else "未 Root——不用 Root，Shizuku 通过就能跑"}——$rootMsg")
         lines.add("Shizuku：${if (szOk) "通过" else "不通过"}——$szMsg")
         refreshPlatforms()
         val dy = detectedPlatforms.firstOrNull { it.packageName == "com.ss.android.ugc.aweme" }
@@ -306,7 +319,11 @@ class MainActivity : ComponentActivity() {
         lines.add("已发布链接：${if (linksOk) "通过（${TaskStore.loadMyPublishedLinks(this).size} 条）" else "不通过——平台页里还没保存已发布视频链接"}")
         selfCheckText = lines.joinToString("\n")
         TaskStore.appendLog(this, "启动自检：\n" + selfCheckText)
-        taskStatus = if (rootOk && dy?.installed == true) "自检通过，可以开始 Root 自动化。" else "自检有不通过的项，请先看上面哪一项。"
+        taskStatus = if ((rootOk || szOk) && dy?.installed == true) {
+            "自检通过：${if (rootOk) "Root" else "Shizuku"} 模式，可以开始自动化。"
+        } else {
+            "自检有不通过的项，请先看上面哪一项。"
+        }
         refreshLog()
     }
 
@@ -359,15 +376,16 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** 用 Root 直接启动抖音（monkey 按包名启动，不依赖无障碍）。 */
+    /** 用自动化引擎启动抖音（Root 或 Shizuku，monkey 按包名启动，不依赖无障碍）。 */
     fun openDouyinByRoot() {
-        val (rootOk, rootMsg) = RootHelper.checkRoot()
-        if (!rootOk) {
-            taskStatus = "Root 不可用：$rootMsg"
+        val (engineOk, engineMsg) = engineAvailable()
+        if (!engineOk) {
+            taskStatus = "自动化引擎不可用：$engineMsg"
             return
         }
-        val r = RootHelper.runAsRoot("monkey -p com.ss.android.ugc.aweme -c android.intent.category.LAUNCHER 1")
-        taskStatus = if (r.exitCode == 0) "Root 已启动抖音。" else "Root 启动抖音失败：${r.output.take(150)}"
+        val cmd = "monkey -p com.ss.android.ugc.aweme -c android.intent.category.LAUNCHER 1"
+        val r = if (RootHelper.checkRoot().first) RootHelper.runAsRoot(cmd) else ShizukuHelper.run(cmd)
+        taskStatus = if (r.exitCode == 0) "已启动抖音（$engineMsg）。" else "启动抖音失败：${r.output.take(150)}"
         TaskStore.appendLog(this, taskStatus)
         refreshLog()
     }
@@ -383,12 +401,12 @@ class MainActivity : ComponentActivity() {
             taskStatus = "请先填写自定义评论内容。"
             return
         }
-        val (rootOk, rootMsg) = RootHelper.checkRoot()
-        if (!rootOk) {
-            taskStatus = "Root 不可用，跑不了 Root 评论：$rootMsg"
+        val (engineOk, engineMsg) = engineAvailable()
+        if (!engineOk) {
+            taskStatus = "自动化引擎不可用，跑不了评论：$engineMsg。Shizuku 已运行时，请先点“申请 Shizuku 授权”。"
             return
         }
-        taskStatus = "Root 评论任务开始：共 ${items.size} 条…"
+        taskStatus = "评论任务开始（$engineMsg）：共 ${items.size} 条…"
         TaskStore.appendLog(this, taskStatus)
         refreshLog()
         Thread {
@@ -401,13 +419,13 @@ class MainActivity : ComponentActivity() {
                     TaskStore.appendLog(this, "第 ${i + 1} 条失败：$reason")
                 }
                 runOnUiThread {
-                    taskStatus = "Root 评论进行中：成功 $ok 条，失败 $fail 条（共 ${items.size} 条）"
+                    taskStatus = "评论进行中：成功 $ok 条，失败 $fail 条（共 ${items.size} 条）"
                     refreshLog()
                 }
                 if (i < items.size - 1) Thread.sleep(intervalSec.coerceAtLeast(1) * 1000L)
             }
             runOnUiThread {
-                taskStatus = "Root 评论任务结束：成功 $ok 条，失败 $fail 条。" +
+                taskStatus = "评论任务结束：成功 $ok 条，失败 $fail 条。" +
                     if (fail > 0) "失败原因写在日志里。" else ""
                 TaskStore.appendLog(this, taskStatus)
                 refreshLog()
@@ -709,7 +727,7 @@ fun AutomationApp(activity: MainActivity) {
                     Text("Root 自动化：全程手机本地跑，不用接电脑", style = MaterialTheme.typography.titleMedium)
                     Text("Root 就是开发者权限：有了它，软件自己在手机上跑系统命令（打开应用、读界面、点按屏幕），不用无障碍服务一直活着，也不用电脑。")
                     Spacer(Modifier.height(8.dp))
-                    Text("Root 状态：${activity.rootStatus}")
+                    Text("引擎状态：${activity.rootStatus}")
                     Card(Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(12.dp)) {
                             Text("快速设置向导（按顺序点）", style = MaterialTheme.typography.titleSmall)
@@ -763,13 +781,13 @@ fun AutomationApp(activity: MainActivity) {
                     Spacer(Modifier.height(8.dp))
                     Text(activity.selfCheckText)
                     Spacer(Modifier.height(12.dp))
-                    Text("Root 测试", style = MaterialTheme.typography.titleMedium)
+                    Text("引擎测试", style = MaterialTheme.typography.titleMedium)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { activity.openDouyinByRoot() }) { Text("用 Root 打开抖音") }
+                        Button(onClick = { activity.openDouyinByRoot() }) { Text("打开抖音") }
                     }
                     Spacer(Modifier.height(12.dp))
-                    Text("Root 评论测试", style = MaterialTheme.typography.titleMedium)
-                    Text("用 Root 引擎给已发布视频发评论：先打开链接、读界面确认、点评论入口、填评论、点发送，每一步都验证，失败写原因。")
+                    Text("评论测试（Root/Shizuku）", style = MaterialTheme.typography.titleMedium)
+                    Text("用自动化引擎给已发布视频发评论（Root 或 Shizuku 都能跑）：先打开链接、读界面确认、点评论入口、填评论、点发送，每一步都验证，失败写原因。")
                     OutlinedTextField(
                         value = rootComment,
                         onValueChange = { rootComment = it },
@@ -781,7 +799,7 @@ fun AutomationApp(activity: MainActivity) {
                     Button(
                         onClick = { activity.startRootCommentTask(activity.myPublishedLinks, rootComment, 10) },
                         modifier = Modifier.fillMaxWidth()
-                    ) { Text("开始 Root 评论任务") }
+                    ) { Text("开始评论任务") }
                     Spacer(Modifier.height(8.dp))
                     Text(activity.taskStatus)
                     Text(activity.logText, modifier = Modifier.fillMaxWidth().height(140.dp).verticalScroll(rememberScrollState()))
