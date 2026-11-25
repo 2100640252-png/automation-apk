@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -32,6 +33,10 @@ class MainActivity : ComponentActivity() {
     var updateStatus by mutableStateOf("")
     var selfCheckText by mutableStateOf("还没自检，点“运行启动自检”。")
     var rootStatus by mutableStateOf("未知")
+    var shizukuInstalled by mutableStateOf(false)
+    var shizukuRunning by mutableStateOf(false)
+    var shizukuGranted by mutableStateOf(false)
+    var accessibilityOn by mutableStateOf(false)
     var updateInfo: UpdateChecker.UpdateInfo? by mutableStateOf(null)
     var githubToken by mutableStateOf("")
 
@@ -49,7 +54,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // Shizuku 授权结果回来就刷新自检状态。
         try {
-            rikka.shizuku.Shizuku.addRequestPermissionResultListener { _, _ -> runSelfCheck() }
+            rikka.shizuku.Shizuku.addRequestPermissionResultListener { _, _ ->
+                refreshSetupState()
+                runSelfCheck()
+            }
         } catch (e: Exception) {
         }
         githubToken = TaskStore.loadGithubToken(this)
@@ -58,6 +66,7 @@ class MainActivity : ComponentActivity() {
         refreshLog()
         refreshPlatforms()
         myPublishedLinks = TaskStore.loadMyPublishedLinks(this)
+        refreshSetupState()
         // 启动就主动索取权限：这是 v1.0 打开没反应的直接原因，v1.1 改成一打开就申请。
         permissionLauncher.launch(PermissionHelper.runtimePermissions.toTypedArray())
         setContent { AutomationApp(this) }
@@ -68,6 +77,7 @@ class MainActivity : ComponentActivity() {
         refreshPermissions()
         refreshVideos()
         refreshLog()
+        refreshSetupState()
         taskStatus = AutomationService.lastStatus
     }
 
@@ -281,6 +291,51 @@ class MainActivity : ComponentActivity() {
         TaskStore.appendLog(this, "启动自检：\n" + selfCheckText)
         taskStatus = if (rootOk && dy?.installed == true) "自检通过，可以开始 Root 自动化。" else "自检有不通过的项，请先看上面哪一项。"
         refreshLog()
+    }
+
+    /** 设置向导状态：Shizuku 装没装、启动没启动、授权没授权、无障碍开没开。 */
+    fun refreshSetupState() {
+        shizukuInstalled = try {
+            packageManager.getPackageInfo("moe.shizuku.privileged.api", 0)
+            true
+        } catch (e: Exception) {
+            false
+        }
+        shizukuRunning = ShizukuHelper.isAvailable()
+        shizukuGranted = ShizukuHelper.isPermissionGranted()
+        accessibilityOn = PermissionHelper.isAccessibilityEnabled(this)
+    }
+
+    /** 打开 Shizuku App；没装就去下载页。 */
+    fun openShizukuApp() {
+        val intent = packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")
+        if (intent != null) {
+            startActivity(intent)
+        } else {
+            openShizukuDownload()
+        }
+    }
+
+    /** 打开 Shizuku 官方下载页。 */
+    fun openShizukuDownload() {
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/RikkaApps/Shizuku/releases")))
+        } catch (e: Exception) {
+            taskStatus = "打不开 Shizuku 下载页：${e.message}"
+        }
+    }
+
+    /** 打开开发者选项（无线调试开关在这里面）。 */
+    fun openDeveloperOptions() {
+        try {
+            startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+        } catch (e: Exception) {
+            try {
+                startActivity(Intent(Settings.ACTION_SETTINGS))
+            } catch (e2: Exception) {
+                taskStatus = "打不开开发者选项：${e2.message}"
+            }
+        }
     }
 
     /** 用 Root 直接启动抖音（monkey 按包名启动，不依赖无障碍）。 */
@@ -625,11 +680,53 @@ fun AutomationApp(activity: MainActivity) {
                     Text("Root 就是开发者权限：有了它，软件自己在手机上跑系统命令（打开应用、读界面、点按屏幕），不用无障碍服务一直活着，也不用电脑。")
                     Spacer(Modifier.height(8.dp))
                     Text("Root 状态：${activity.rootStatus}")
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { ShizukuHelper.requestPermission() }) { Text("申请 Shizuku 授权") }
-                        Button(onClick = { activity.runSelfCheck() }) { Text("重新检测 Shizuku") }
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text("快速设置向导（按顺序点）", style = MaterialTheme.typography.titleSmall)
+                            val step1 = if (activity.shizukuInstalled) "已完成" else "未完成"
+                            val step2 = if (activity.shizukuRunning) "已完成" else "未完成"
+                            val step3 = if (activity.shizukuGranted) "已完成" else "未完成"
+                            val step4 = if (activity.accessibilityOn) "已完成" else "未完成"
+                            Text("第 1 步：安装 Shizuku —— $step1")
+                            if (!activity.shizukuInstalled) {
+                                Button(onClick = { activity.openShizukuDownload() }, modifier = Modifier.fillMaxWidth()) {
+                                    Text("去下载 Shizuku")
+                                }
+                            }
+                            Text("第 2 步：启动 Shizuku —— $step2")
+                            if (!activity.shizukuRunning) {
+                                Text("先去开发者选项打开“无线调试”，再打开 Shizuku，点“通过无线调试启动”，按提示配对。")
+                                Button(onClick = { activity.openDeveloperOptions() }, modifier = Modifier.fillMaxWidth()) {
+                                    Text("打开开发者选项")
+                                }
+                                Button(onClick = { activity.openShizukuApp() }, modifier = Modifier.fillMaxWidth()) {
+                                    Text("打开 Shizuku")
+                                }
+                            }
+                            Text("第 3 步：给本软件授权 —— $step3")
+                            if (!activity.shizukuGranted) {
+                                Button(onClick = { ShizukuHelper.requestPermission() }, modifier = Modifier.fillMaxWidth()) {
+                                    Text("申请 Shizuku 授权")
+                                }
+                            }
+                            Text("第 4 步：开无障碍（填中文评论要用） —— $step4")
+                            if (!activity.accessibilityOn) {
+                                Button(onClick = { PermissionHelper.openAccessibilitySettings(activity) }, modifier = Modifier.fillMaxWidth()) {
+                                    Text("去开启无障碍")
+                                }
+                            }
+                            if (activity.shizukuInstalled && activity.shizukuRunning && activity.shizukuGranted && activity.accessibilityOn) {
+                                Text("设置完成，可以开始 Root 自动化。")
+                            }
+                            OutlinedButton(onClick = {
+                                activity.refreshSetupState()
+                                activity.runSelfCheck()
+                            }, modifier = Modifier.fillMaxWidth()) {
+                                Text("重新检测")
+                            }
+                        }
                     }
-                    Text("Shizuku 不用 Root：装 Shizuku App，开发者模式里开无线调试配对启动，再点上面申请授权。")
+                    Spacer(Modifier.height(8.dp))
                     Button(onClick = { activity.runSelfCheck() }, modifier = Modifier.fillMaxWidth()) {
                         Text("运行启动自检")
                     }
