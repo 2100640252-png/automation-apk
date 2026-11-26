@@ -1,5 +1,7 @@
 package com.automation.work
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -29,6 +31,7 @@ class MainActivity : ComponentActivity() {
     var myPublishedLinks by mutableStateOf(listOf<String>())
     var permissionStatus by mutableStateOf(listOf<PermissionHelper.PermissionStatus>())
     var logText by mutableStateOf("暂无运行记录。")
+    var errorReportText by mutableStateOf("暂无错误报告。")
     var taskStatus by mutableStateOf("未开始")
     var updateStatus by mutableStateOf("")
     var selfCheckText by mutableStateOf("还没自检，点“运行启动自检”。")
@@ -249,7 +252,32 @@ class MainActivity : ComponentActivity() {
             return
         }
         AutomationService.startLinkComment(this, link.trim(), comment)
-        taskStatus = "正在打开链接并按记录的点击序列评论…"
+        taskStatus = "正在自动打开链接、识别页面并评论…"
+        refreshLog()
+    }
+
+    fun showIntervention() {
+        if (AutomationService.instance == null) {
+            taskStatus = "真人介入窗需要无障碍，已打开无障碍设置，开启后回来再点。"
+            PermissionHelper.openAccessibilitySettings(this)
+            return
+        }
+        AutomationService.showInterventionNow(this)
+        taskStatus = "真人介入窗已打开：可以手动操作、重新识别、保存错误报告。"
+        refreshLog()
+    }
+
+    fun copyErrorReport() {
+        val report = TaskStore.loadLastErrorReport(this)
+        val clipboard = getSystemService(ClipboardManager::class.java)
+        clipboard?.setPrimaryClip(ClipData.newPlainText("automation_error_report", report))
+        taskStatus = "错误报告已复制，可以发出来定位是哪一步失败。"
+        refreshLog()
+    }
+
+    fun clearErrorReports() {
+        TaskStore.clearErrorReports(this)
+        taskStatus = "错误报告已清空。"
         refreshLog()
     }
 
@@ -279,13 +307,24 @@ class MainActivity : ComponentActivity() {
         val video = videos.firstOrNull()
         if (video == null) { taskStatus = "先选择一个视频。"; return }
         val (ok, reason) = AppDetector.publishVideoDetailed(this, platform, video.path, caption)
-        taskStatus = reason
         TaskStore.appendLog(this, "发视频：$reason")
+        if (ok) {
+            val pkg = AppDetector.publishPackages[platform]
+            if (pkg != null) {
+                AutomationService.startPublishAssist(this, platform, pkg, caption)
+                taskStatus = "已打开 $platform 发布页，正在自动填文案、点发布并验证…"
+            } else {
+                taskStatus = reason
+            }
+        } else {
+            taskStatus = reason
+        }
         refreshLog()
     }
 
     fun refreshLog() {
         logText = TaskStore.loadLog(this)
+        errorReportText = TaskStore.loadLastErrorReport(this)
     }
 
     fun requestPermissions() {
@@ -571,8 +610,14 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun AutomationApp(activity: MainActivity) {
     val savedInputs = remember { TaskStore.loadCommentInputs(activity) }
-    var link by remember { mutableStateOf(savedInputs.first.firstOrNull { it.isNotBlank() } ?: "") }
+    val links = remember {
+        mutableStateListOf<String>().apply {
+            addAll(savedInputs.first.filter { it.isNotBlank() })
+            add("")
+        }
+    }
     var commentText by remember { mutableStateOf(savedInputs.second) }
+    var intervalText by remember { mutableStateOf(savedInputs.third.ifBlank { "10" }) }
     var caption by remember { mutableStateOf("") }
     var platform by remember { mutableStateOf("快手") }
     var stepsRefresh by remember { mutableStateOf(0) }
@@ -581,8 +626,15 @@ fun AutomationApp(activity: MainActivity) {
     val missing = activity.permissionStatus.filter { !it.granted }
 
     fun persist() {
-        val links = listOf(link) + savedInputs.first.drop(1)
-        TaskStore.saveCommentInputs(activity, links, commentText, savedInputs.third)
+        TaskStore.saveCommentInputs(activity, links.toList(), commentText, intervalText)
+    }
+
+    fun normalizeLinks() {
+        val filled = links.filter { it.isNotBlank() }
+        links.clear()
+        links.addAll(filled)
+        links.add("")
+        persist()
     }
 
     Scaffold(
@@ -617,15 +669,20 @@ fun AutomationApp(activity: MainActivity) {
                 Spacer(Modifier.height(12.dp))
             }
 
-            Text("链接", style = MaterialTheme.typography.titleMedium)
+            Text("链接：填完一个，下一个自动出现；下一个不填就截止", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
-            OutlinedTextField(
-                value = link,
-                onValueChange = { link = it; persist() },
-                label = { Text("视频链接（输入后一直保存）") },
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(Modifier.height(8.dp))
+            links.forEachIndexed { index, value ->
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = {
+                        links[index] = it
+                        normalizeLinks()
+                    },
+                    label = { Text(if (value.isBlank()) "第 ${index + 1} 条链接（不填就截止）" else "第 ${index + 1} 条链接") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(8.dp))
+            }
             OutlinedTextField(
                 value = commentText,
                 onValueChange = { commentText = it; persist() },
@@ -633,16 +690,31 @@ fun AutomationApp(activity: MainActivity) {
                 modifier = Modifier.fillMaxWidth().height(90.dp)
             )
             Spacer(Modifier.height(8.dp))
+            OutlinedTextField(
+                value = intervalText,
+                onValueChange = { intervalText = it; persist() },
+                label = { Text("每条间隔秒数") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { activity.openLinkOnly(link) }, modifier = Modifier.weight(1f)) { Text("打开链接") }
-                Button(onClick = { activity.startLinkComment(link, commentText) }, modifier = Modifier.weight(1f)) { Text("开始评论") }
+                Button(
+                    onClick = { activity.openLinkOnly(links.firstOrNull { it.isNotBlank() } ?: "") },
+                    modifier = Modifier.weight(1f)
+                ) { Text("打开第一条") }
+                Button(
+                    onClick = { activity.startCommentTask(links.toList(), commentText, intervalText.toIntOrNull() ?: 10) },
+                    modifier = Modifier.weight(1f)
+                ) { Text("开始评论") }
                 OutlinedButton(onClick = { activity.stopCommentTask() }, modifier = Modifier.weight(1f)) { Text("停止") }
             }
+            Spacer(Modifier.height(6.dp))
+            Text("开始后按顺序逐条处理：自动打开、自动识别、填评论、点发送、验证结果。哪一步失败，就弹出真人介入窗并保存错误报告。")
 
             Spacer(Modifier.height(16.dp))
-            Text("模拟真人器：你点哪里，软件记哪里", style = MaterialTheme.typography.titleMedium)
+            Text("真人设定：失败时可手动校准和记录", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
-            Text("选平台，点开始记录点击，切到平台按顺序点按键（评论键、输入框、发送键），软件记住每个位置。评论时按记录真实回放。")
+            Text("正常评论走自动识别状态机，不再盲目回放。这里是真人介入时的设定工具：自动识别不到时，可以记录点击位置或校准点位，再让软件重新识别。")
             Spacer(Modifier.height(8.dp))
             platforms.chunked(4).forEach { row ->
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -741,9 +813,9 @@ fun AutomationApp(activity: MainActivity) {
             )
             Spacer(Modifier.height(8.dp))
             Button(onClick = { activity.publishVideoSimple(platform, caption) }, modifier = Modifier.fillMaxWidth()) {
-                Text("发视频到$platform（打开发布页）")
+                Text("发视频到$platform（自动发布）")
             }
-            Text("发布页打开后，可用上面的点击序列点发布。")
+            Text("发布页打开后，软件会自动填文案、点发布并验证；失败会弹出真人介入窗并保存错误报告。")
 
             Spacer(Modifier.height(16.dp))
             Text(activity.taskStatus)
@@ -751,6 +823,14 @@ fun AutomationApp(activity: MainActivity) {
                 Spacer(Modifier.height(8.dp))
                 Text("发现新版：${activity.updateInfo!!.tag}")
                 Button(onClick = { activity.downloadUpdate() }, modifier = Modifier.fillMaxWidth()) { Text("下载并安装新版") }
+            }
+            Spacer(Modifier.height(8.dp))
+            Text("错误报告：", style = MaterialTheme.typography.titleSmall)
+            Text(activity.errorReportText, modifier = Modifier.fillMaxWidth().height(150.dp).verticalScroll(rememberScrollState()))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { activity.showIntervention() }, modifier = Modifier.weight(1f)) { Text("打开真人介入窗") }
+                OutlinedButton(onClick = { activity.copyErrorReport() }, modifier = Modifier.weight(1f)) { Text("复制错误报告") }
+                TextButton(onClick = { activity.clearErrorReports() }, modifier = Modifier.weight(1f)) { Text("清空报告") }
             }
             Spacer(Modifier.height(8.dp))
             Text("运行日志：", style = MaterialTheme.typography.titleSmall)

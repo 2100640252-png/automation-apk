@@ -19,9 +19,12 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 
 /**
  * 无障碍屏幕控制服务（v1.8 诊断版）。
@@ -53,6 +56,12 @@ class AutomationService : AccessibilityService() {
         var expectedPackage: String? = null
         var expectedPlatform: String = ""
 
+        // 真人介入状态：失败后暂停自动化，弹出悬浮窗让真人操作、设定、报告错误。
+        var pausedForHuman: Boolean = false
+        var lastFailureReason: String = ""
+        var lastFailureKind: String = ""
+        var currentFailureCounted: Boolean = false
+
         // 发视频辅助状态
         var publishRunning: Boolean = false
         var publishPlatform: String = ""
@@ -75,6 +84,11 @@ class AutomationService : AccessibilityService() {
             currentIndex = 0
             successCount = 0
             failCount = 0
+            pausedForHuman = false
+            lastFailureReason = ""
+            lastFailureKind = ""
+            currentFailureCounted = false
+            instance?.removeIntervention()
             running = true
             lastStatus = "任务开始：共 ${task.items.size} 条"
             TaskStore.appendLog(context, lastStatus)
@@ -115,27 +129,31 @@ class AutomationService : AccessibilityService() {
             Thread {
                 val result = LinkResolver.openVideoLinkDetailed(context, link)
                 TaskStore.appendLog(context, "打开链接：${result.reason}")
+                if (!result.success) {
+                    TaskStore.saveErrorReport(
+                        context,
+                        "错误报告\n时间：${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())}\n任务：只打开链接\n链接：$link\n平台：${result.platform}\n错误：${result.reason}\n"
+                    )
+                }
             }.start()
         }
 
-        /** 打开链接后按该平台记录的点击序列真实回放（模拟真人）。 */
+        /** 单条链接评论：走状态机自动打开、识别、填评论、发送、验证，不再盲目回放点击序列。 */
         fun startLinkComment(context: Context, link: String, comment: String) {
-            val svc = instance
-            if (svc == null) {
+            if (instance == null) {
                 TaskStore.appendLog(context, "开始失败：无障碍服务没在运行，请先开启无障碍。")
                 return
             }
-            Thread {
-                val result = LinkResolver.openVideoLinkDetailed(context, link)
-                handler.post {
-                    if (!result.success) {
-                        TaskStore.appendLog(context, "打开链接失败：${result.reason}")
-                        return@post
-                    }
-                    TaskStore.appendLog(context, "已打开${result.platform}，3 秒后按记录的点击序列执行…")
-                    handler.postDelayed({ svc.runSequence(result.platform, comment) }, 3000L)
-                }
-            }.start()
+            startTask(context, CommentTask.fromLinks(listOf(link), comment))
+        }
+
+        fun showInterventionNow(context: Context) {
+            val svc = instance
+            if (svc == null) {
+                TaskStore.appendLog(context, "真人介入窗失败：无障碍服务没在运行，请先开启无障碍。")
+                return
+            }
+            svc.showInterventionPanel(lastFailureReason.ifBlank { "手动打开真人介入窗：可以手动操作、重新识别、校准点位、记录点击、保存错误报告。" })
         }
 
         fun runSequenceNow(context: Context, platform: String, comment: String) {
@@ -159,8 +177,10 @@ class AutomationService : AccessibilityService() {
         fun stopTask(context: Context) {
             running = false
             publishRunning = false
+            pausedForHuman = false
             stepRunnable?.let { handler.removeCallbacks(it) }
             publishRunnable?.let { handler.removeCallbacks(it) }
+            instance?.removeIntervention()
             lastStatus = "任务已停止"
             TaskStore.appendLog(context, lastStatus)
         }
@@ -182,7 +202,7 @@ class AutomationService : AccessibilityService() {
                 handler.post {
                     if (!running) return@post
                     if (!result.success) {
-                        instance?.failCurrentAndAdvance(context, task, result.reason)
+                        instance?.interveneCurrent(context, task, result.reason, "LINK")
                             ?: run {
                                 markItemFailed(context, result.reason)
                                 currentIndex++
@@ -227,6 +247,10 @@ class AutomationService : AccessibilityService() {
             publishPackage = packageName
             publishCaption = caption
             publishAttempts = 0
+            pausedForHuman = false
+            lastFailureReason = ""
+            lastFailureKind = ""
+            instance?.removeIntervention()
             publishRunning = true
             TaskStore.appendLog(context, "发视频步骤5：发布页已打开，开始自动填文案、点发布（$platform）…")
             instance?.schedulePublishStep(context, 3000L)
@@ -234,6 +258,8 @@ class AutomationService : AccessibilityService() {
     }
 
     private var attempts: Int = 0
+    private var interventionRoot: View? = null
+    private var interventionNote: EditText? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -246,6 +272,7 @@ class AutomationService : AccessibilityService() {
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) return
+        if (pausedForHuman) return
         if (publishRunning) {
             schedulePublishStep(this, 1500L)
             return
@@ -255,6 +282,7 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun scheduleStep(context: Context, delayMs: Long) {
+        if (pausedForHuman) return
         stepRunnable?.let { handler.removeCallbacks(it) }
         val r = Runnable { tryOneStep(context) }
         stepRunnable = r
@@ -262,6 +290,7 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun schedulePublishStep(context: Context, delayMs: Long) {
+        if (pausedForHuman) return
         publishRunnable?.let { handler.removeCallbacks(it) }
         val r = Runnable { tryPublishStep(context) }
         publishRunnable = r
@@ -288,7 +317,7 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun tryOneStep(context: Context) {
-        if (!running) return
+        if (!running || pausedForHuman) return
         val task = currentTask ?: return
         if (currentIndex >= task.items.size) {
             openCurrent(context)
@@ -299,8 +328,7 @@ class AutomationService : AccessibilityService() {
             TaskStore.appendLog(context, "步骤4 验证界面：拿不到当前窗口（第 $attempts 次），重试…")
             if (attempts >= 3) {
                 attempts = 0
-                markItemFailed(context, "步骤4 失败：打不开页面，拿不到窗口")
-                advance(context, task)
+                interveneCurrent(context, task, "步骤4 失败：打不开页面，拿不到窗口")
             } else scheduleStep(context, 3000L)
             return
         }
@@ -309,28 +337,24 @@ class AutomationService : AccessibilityService() {
         val expected = expectedPackage
         if (expected != null && rootPkg != expected) {
             if (rootPkg in browserPackages) {
-                markItemFailed(context, "步骤4 失败：链接被浏览器打开了，$expectedPlatform 没有接管（当前应用：$rootPkg）")
-                advance(context, task)
+                interveneCurrent(context, task, "步骤4 失败：链接被浏览器打开了，$expectedPlatform 没有接管（当前应用：$rootPkg）")
                 return
             }
             attempts++
             TaskStore.appendLog(context, "步骤4 验证界面：当前不在$expectedPlatform（当前：$rootPkg），等它打开…（第 $attempts 次）")
             if (attempts >= 3) {
                 attempts = 0
-                markItemFailed(context, "步骤4 失败：打开后不在目标 App（当前：$rootPkg，应为：$expected）")
-                advance(context, task)
+                interveneCurrent(context, task, "步骤4 失败：打开后不在目标 App（当前：$rootPkg，应为：$expected）")
             } else scheduleStep(context, 3000L)
             return
         }
         val allText = treeText(root)
         if (allText.contains("请先登录") || allText.contains("立即登录") || allText.contains("登录后")) {
-            markItemFailed(context, "步骤5 失败：$expectedPlatform 要求登录，请先在 App 里登录账号")
-            advance(context, task)
+            interveneCurrent(context, task, "步骤5 失败：$expectedPlatform 要求登录，请先在 App 里登录账号")
             return
         }
         if (allText.contains("验证码") || allText.contains("滑块") || allText.contains("安全验证")) {
-            markItemFailed(context, "步骤5 失败：$expectedPlatform 弹出了验证（验证码/滑块），自动评论被平台拦下")
-            advance(context, task)
+            interveneCurrent(context, task, "步骤5 失败：$expectedPlatform 弹出了验证（验证码/滑块），自动评论被平台拦下")
             return
         }
         // 步骤6：找评论输入框。快手/抖音的发送键常是右下角图标、没有文字，
@@ -355,8 +379,7 @@ class AutomationService : AccessibilityService() {
                     TaskStore.appendLog(context, "步骤6 填评论：填入后验证不到文字（第 $attempts 次）")
                     if (attempts >= 3) {
                         attempts = 0
-                        markItemFailed(context, "步骤6 失败：评论填不进去（输入框不接受填入）")
-                        advance(context, task)
+                        interveneCurrent(context, task, "步骤6 失败：评论填不进去（输入框不接受填入）")
                     } else scheduleStep(context, 3000L)
                 }
             }, 700L)
@@ -369,8 +392,7 @@ class AutomationService : AccessibilityService() {
             attempts++
             if (attempts >= 6) {
                 attempts = 0
-                markItemFailed(context, "步骤5 失败：按配置评论点点了但评论框一直不出现（点位可能偏了，去点位页重新校准）")
-                advance(context, task)
+                interveneCurrent(context, task, "步骤5 失败：按配置评论点点了但评论框一直不出现（点位可能偏了，去点位页重新校准）")
             } else scheduleStep(context, 2500L)
             return
         }
@@ -381,8 +403,7 @@ class AutomationService : AccessibilityService() {
             attempts++
             if (attempts >= 6) {
                 attempts = 0
-                markItemFailed(context, "步骤5 失败：点了评论输入框但输入框一直不出现")
-                advance(context, task)
+                interveneCurrent(context, task, "步骤5 失败：点了评论输入框但输入框一直不出现")
             } else scheduleStep(context, 2000L)
             return
         }
@@ -393,8 +414,7 @@ class AutomationService : AccessibilityService() {
             attempts++
             if (attempts >= 6) {
                 attempts = 0
-                markItemFailed(context, "步骤5 失败：点了评论入口但评论框一直不出现")
-                advance(context, task)
+                interveneCurrent(context, task, "步骤5 失败：点了评论入口但评论框一直不出现")
             } else scheduleStep(context, 2500L)
             return
         }
@@ -402,20 +422,18 @@ class AutomationService : AccessibilityService() {
         TaskStore.appendLog(context, "步骤5 打开评论区：界面上没有评论入口（第 $attempts 次）")
         if (attempts >= 3) {
             attempts = 0
-            markItemFailed(context, "步骤5 失败：页面里没有评论入口（可能不是视频页，或评论被关闭）")
-            advance(context, task)
+            interveneCurrent(context, task, "步骤5 失败：页面里没有评论入口（可能不是视频页，或评论被关闭）")
         } else scheduleStep(context, 3000L)
     }
 
     private fun trySend(context: Context, task: CommentTask) {
-        if (!running) return
+        if (!running || pausedForHuman) return
         val root = rootInActiveWindow
         if (root == null) {
             attempts++
             if (attempts >= 3) {
                 attempts = 0
-                markItemFailed(context, "步骤7 失败：找不到发送键（拿不到界面）")
-                advance(context, task)
+                interveneCurrent(context, task, "步骤7 失败：找不到发送键（拿不到界面）")
             } else scheduleStep(context, 3000L)
             return
         }
@@ -443,44 +461,42 @@ class AutomationService : AccessibilityService() {
         TaskStore.appendLog(context, "步骤7 点发送：发送键没找到（文字和右下角位置都没找到，第 $attempts 次）")
         if (attempts >= 3) {
             attempts = 0
-            markItemFailed(context, "步骤7 失败：找不到发送键（快手/抖音发送键可能是图标，已按右下角位置找过仍没有；去点位页校准发送点后按位置点）")
-            advance(context, task)
+            interveneCurrent(context, task, "步骤7 失败：找不到发送键（快手/抖音发送键可能是图标，已按右下角位置找过仍没有；去点位页校准发送点后按位置点）")
         } else scheduleStep(context, 3000L)
     }
 
     private fun verifySent(context: Context, task: CommentTask) {
-        if (!running) return
+        if (!running || pausedForHuman) return
         val root = rootInActiveWindow
         val probe = task.commentText.take(6)
-        val sent = if (root == null) false else {
-            val text = treeText(root)
-            val input = findEditableCommentBox(root)
-            val inputText = input?.text?.toString() ?: ""
-            text.contains(probe) || (input != null && !inputText.contains(probe))
-        }
+        val text = root?.let { treeText(it) } ?: ""
+        val input = root?.let { findEditableCommentBox(it) }
+        val inputText = input?.text?.toString() ?: ""
+        val sent = text.contains(probe) || text.contains("评论成功") || text.contains("发送成功")
+        val inputCleared = input != null && inputText.isBlank()
         if (sent) {
             TaskStore.appendLog(context, "步骤8 验证：评论已发出。")
             markItemSuccess(context)
             attempts = 0
             advance(context, task)
+        } else if (inputCleared) {
+            interveneCurrent(context, task, "步骤8 失败：输入框已清空，但没有在界面上验证到评论出现，已暂停等真人确认，避免重复发送")
         } else {
             attempts++
             TaskStore.appendLog(context, "步骤8 验证：没验证到评论发出（第 $attempts 次）")
             if (attempts >= 2) {
                 attempts = 0
-                markItemFailed(context, "步骤8 失败：点了发送但没有验证到评论发出（可能被平台拦截、需要登录或验证）")
-                advance(context, task)
+                interveneCurrent(context, task, "步骤8 失败：点了发送但没有验证到评论发出（可能被平台拦截、需要登录或验证）")
             } else scheduleStep(context, 3000L)
         }
     }
 
     private fun tryPublishStep(context: Context) {
-        if (!publishRunning) return
+        if (!publishRunning || pausedForHuman) return
         val root = rootInActiveWindow ?: run {
             publishAttempts++
             if (publishAttempts >= 6) {
-                publishRunning = false
-                TaskStore.appendLog(context, "发视频步骤6 失败：拿不到发布页界面（$publishPlatform）")
+                intervenePublish(context, "发视频步骤6 失败：拿不到发布页界面（$publishPlatform）")
             } else schedulePublishStep(context, 3000L)
             return
         }
@@ -489,14 +505,15 @@ class AutomationService : AccessibilityService() {
             publishAttempts++
             TaskStore.appendLog(context, "发视频步骤6：当前不在$publishPlatform 发布页（当前：$rootPkg），等待…（第 $publishAttempts 次）")
             if (publishAttempts >= 6) {
-                publishRunning = false
-                TaskStore.appendLog(context, "发视频步骤6 失败：发布页没有打开（当前应用：$rootPkg）")
+                intervenePublish(context, "发视频步骤6 失败：发布页没有打开（当前应用：$rootPkg）")
             } else schedulePublishStep(context, 3000L)
             return
         }
         val allText = treeText(root)
         if (allText.contains("发布成功") || allText.contains("已发布") || allText.contains("投稿成功")) {
             publishRunning = false
+            pausedForHuman = false
+            removeIntervention()
             lastStatus = "视频已发布到$publishPlatform（已验证）。"
             TaskStore.appendLog(context, "发视频步骤8 验证：$publishPlatform 显示发布成功。")
             return
@@ -517,28 +534,30 @@ class AutomationService : AccessibilityService() {
             publishAttempts++
             TaskStore.appendLog(context, "发视频步骤7：已点发布按钮（第 $publishAttempts 次），等待验证…")
             if (publishAttempts >= 6) {
-                publishRunning = false
-                TaskStore.appendLog(context, "发视频步骤8 失败：点了发布但没有验证到发布成功（可能需要登录、验证或平台审核）")
+                intervenePublish(context, "发视频步骤8 失败：点了发布但没有验证到发布成功（可能需要登录、验证或平台审核）")
             } else schedulePublishStep(context, 3000L)
             return
         }
         publishAttempts++
         TaskStore.appendLog(context, "发视频步骤7：发布页上没有找到发布按钮（第 $publishAttempts 次）")
         if (publishAttempts >= 6) {
-            publishRunning = false
-            TaskStore.appendLog(context, "发视频步骤7 失败：找不到发布按钮，请手动点发布")
+            intervenePublish(context, "发视频步骤7 失败：找不到发布按钮，请手动点发布")
         } else schedulePublishStep(context, 3000L)
     }
 
     fun failCurrentAndAdvance(context: Context, task: CommentTask, reason: String = "打不开链接") {
-        markItemFailed(context, reason)
-        advance(context, task)
+        interveneCurrent(context, task, reason)
     }
 
     private fun advance(context: Context, task: CommentTask) {
         currentIndex++
         attempts = 0
         expectedPackage = null
+        pausedForHuman = false
+        lastFailureReason = ""
+        lastFailureKind = ""
+        currentFailureCounted = false
+        removeIntervention()
         if (currentIndex >= task.items.size) {
             running = false
             lastStatus = finishStatus()
@@ -549,6 +568,283 @@ class AutomationService : AccessibilityService() {
         lastStatus = "等 ${task.intervalSeconds} 秒后处理下一条…"
         TaskStore.appendLog(context, lastStatus)
         handler.postDelayed({ openCurrent(context) }, delayMs)
+    }
+
+    // ---------- 真人介入：失败报错、暂停、悬浮窗、错误报告 ----------
+
+    fun interveneCurrent(context: Context, task: CommentTask, reason: String, kind: String = "STEP") {
+        lastFailureReason = reason
+        lastFailureKind = kind
+        pausedForHuman = true
+        stepRunnable?.let { handler.removeCallbacks(it) }
+        lastStatus = "需要真人介入：$reason"
+        saveCurrentErrorReport(context, reason, "")
+        TaskStore.appendLog(context, "真人介入：$reason 已暂停，悬浮窗里可以手动操作、重新识别、校准、记录点击、保存报告。")
+        showInterventionPanel(reason)
+    }
+
+    private fun intervenePublish(context: Context, reason: String) {
+        lastFailureReason = reason
+        lastFailureKind = "PUBLISH"
+        pausedForHuman = true
+        publishRunnable?.let { handler.removeCallbacks(it) }
+        lastStatus = "需要真人介入：$reason"
+        saveCurrentErrorReport(context, reason, "")
+        TaskStore.appendLog(context, "真人介入：$reason 已暂停，悬浮窗里可以手动操作、重新识别、校准、记录点击、保存报告。")
+        showInterventionPanel(reason)
+    }
+
+    private fun platformForIntervention(): String {
+        if (publishRunning && publishPlatform.isNotBlank()) return publishPlatform
+        if (expectedPlatform.isNotBlank()) return expectedPlatform
+        val itemPlatform = currentTask?.items?.getOrNull(currentIndex)?.platform ?: ""
+        return itemPlatform.ifBlank { "快手" }
+    }
+
+    private fun saveCurrentErrorReport(context: Context, reason: String, userNote: String) {
+        val report = buildDiagnosticReport(reason, userNote)
+        TaskStore.saveErrorReport(context, report)
+        TaskStore.appendLog(context, "错误报告已保存：$reason")
+    }
+
+    private fun buildDiagnosticReport(reason: String, userNote: String): String {
+        val root = rootInActiveWindow
+        val rootPkg = root?.packageName?.toString() ?: "拿不到窗口"
+        val pageText = root?.let { treeText(it).replace(Regex("\\s+"), " ").trim().take(600) } ?: ""
+        val item = currentTask?.items?.getOrNull(currentIndex)
+        val time = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())
+        return buildString {
+            appendLine("错误报告")
+            appendLine("时间：$time")
+            appendLine("错误：$reason")
+            appendLine("失败类型：${lastFailureKind.ifBlank { "STEP" }}")
+            appendLine("平台：${platformForIntervention()}")
+            appendLine("期望包名：${expectedPackage ?: publishPackage.ifBlank { "未知" }}")
+            appendLine("当前包名：$rootPkg")
+            if (item != null) {
+                appendLine("第几条：第 ${item.index} 条")
+                appendLine("链接：${item.link}")
+                appendLine("评论：${currentTask?.commentText ?: ""}")
+            }
+            if (publishRunning) {
+                appendLine("发视频平台：$publishPlatform")
+                appendLine("视频文案：$publishCaption")
+            }
+            if (userNote.isNotBlank()) appendLine("真人补充：$userNote")
+            appendLine("页面文字摘要：$pageText")
+            appendLine("控件摘要：")
+            append(nodeSummary(root))
+        }
+    }
+
+    private fun nodeSummary(root: AccessibilityNodeInfo?): String {
+        if (root == null) return "拿不到当前窗口控件。\n"
+        val lines = mutableListOf<String>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var visited = 0
+        while (queue.isNotEmpty() && visited < 160 && lines.size < 40) {
+            val node = queue.removeFirst()
+            visited++
+            val text = nodeText(node).replace(Regex("\\s+"), " ").trim()
+            if (node.isClickable || node.isEditable || text.isNotBlank()) {
+                val b = Rect()
+                node.getBoundsInScreen(b)
+                val cls = node.className?.toString()?.substringAfterLast('.') ?: ""
+                lines.add("- $cls text=${text.take(60)} bounds=${b.left},${b.top},${b.right},${b.bottom} clickable=${node.isClickable} editable=${node.isEditable} focused=${node.isFocused}")
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { queue.add(it) }
+        }
+        return if (lines.isEmpty()) "没有可读控件。\n" else lines.joinToString("\n") + "\n"
+    }
+
+    private fun resumeAfterIntervention(context: Context) {
+        removeIntervention()
+        pausedForHuman = false
+        attempts = 0
+        publishAttempts = 0
+        TaskStore.appendLog(context, "真人介入结束：重新识别当前页面并继续。")
+        if (publishRunning) {
+            schedulePublishStep(context, 800L)
+        } else if (lastFailureKind == "LINK") {
+            val rootPkg = rootInActiveWindow?.packageName?.toString() ?: ""
+            if (rootPkg.isNotBlank() && rootPkg !in browserPackages && rootPkg != packageName) {
+                expectedPackage = rootPkg
+                if (expectedPlatform.isBlank()) expectedPlatform = platformForIntervention()
+                scheduleStep(context, 800L)
+            } else {
+                openCurrent(context)
+            }
+        } else {
+            scheduleStep(context, 800L)
+        }
+    }
+
+    private fun skipAfterIntervention(context: Context) {
+        removeIntervention()
+        pausedForHuman = false
+        if (publishRunning) {
+            publishRunning = false
+            lastStatus = "发视频已跳过：${lastFailureReason}"
+            TaskStore.appendLog(context, lastStatus)
+            return
+        }
+        val task = currentTask ?: return
+        if (!currentFailureCounted) {
+            markItemFailed(context, lastFailureReason.ifBlank { "真人跳过" })
+            currentFailureCounted = true
+        }
+        advance(context, task)
+    }
+
+    private fun interventionParams(gravityValue: Int, focusable: Boolean): WindowManager.LayoutParams {
+        val flags = if (focusable) {
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+        } else {
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+        }
+        return WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            flags,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = gravityValue }
+    }
+
+    fun showInterventionPanel(reason: String) {
+        removeIntervention()
+        pausedForHuman = true
+        val wm = getSystemService(WindowManager::class.java) ?: return
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.argb(238, 18, 18, 18))
+            setPadding(24, 18, 24, 18)
+        }
+        val title = TextView(this).apply {
+            text = "真人介入：自动化停在这里"
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        }
+        val error = TextView(this).apply {
+            text = reason
+            setTextColor(Color.rgb(255, 220, 160))
+            textSize = 14f
+        }
+        val snapshot = TextView(this).apply {
+            val root = rootInActiveWindow
+            val pkg = root?.packageName?.toString() ?: "拿不到窗口"
+            val txt = root?.let { treeText(it).replace(Regex("\\s+"), " ").trim().take(180) } ?: ""
+            text = "当前应用：$pkg\n页面摘要：$txt"
+            setTextColor(Color.LTGRAY)
+            textSize = 12f
+        }
+        val note = EditText(this).apply {
+            hint = "补充错误说明（可选）：比如按钮在右下角、页面弹了登录"
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.GRAY)
+            minLines = 1
+            maxLines = 3
+        }
+        interventionNote = note
+        fun row(vararg buttons: Button): LinearLayout {
+            return LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                buttons.forEach { addView(it, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)) }
+            }
+        }
+        fun btn(text: String, action: () -> Unit): Button {
+            return Button(this).apply {
+                this.text = text
+                setOnClickListener { action() }
+            }
+        }
+        panel.addView(title)
+        panel.addView(error)
+        panel.addView(snapshot)
+        panel.addView(note)
+        panel.addView(row(
+            btn("重试当前步") { resumeAfterIntervention(this) },
+            btn("我来操作") { showManualBar() },
+            btn("继续识别") { resumeAfterIntervention(this) }
+        ))
+        panel.addView(row(
+            btn("保存报告") {
+                saveCurrentErrorReport(this, reason, note.text?.toString() ?: "")
+                Toast.makeText(this, "错误报告已保存", Toast.LENGTH_SHORT).show()
+            },
+            btn("校准发送点") {
+                removeIntervention()
+                showCalibration(platformForIntervention(), PointStore.KIND_SEND)
+            },
+            btn("记录点击") {
+                removeIntervention()
+                showRecorder(platformForIntervention())
+            }
+        ))
+        panel.addView(row(
+            btn("跳过这一条") { skipAfterIntervention(this) },
+            btn("停止任务") { stopTask(this) },
+            btn("收起") { showManualBar() }
+        ))
+        val scroll = ScrollView(this).apply { addView(panel) }
+        try {
+            wm.addView(scroll, interventionParams(Gravity.BOTTOM, focusable = true))
+            interventionRoot = scroll
+        } catch (e: Exception) {
+            TaskStore.appendLog(this, "真人介入窗打开失败：${e.message}")
+        }
+    }
+
+    private fun showManualBar() {
+        removeIntervention()
+        pausedForHuman = true
+        val wm = getSystemService(WindowManager::class.java) ?: return
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.argb(225, 18, 18, 18))
+            setPadding(16, 10, 16, 10)
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val label = TextView(this).apply {
+            text = "真人操作中"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+        }
+        bar.addView(label, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        bar.addView(Button(this).apply {
+            text = "继续识别"
+            setOnClickListener { resumeAfterIntervention(this@AutomationService) }
+        })
+        bar.addView(Button(this).apply {
+            text = "保存报告"
+            setOnClickListener {
+                saveCurrentErrorReport(this@AutomationService, lastFailureReason.ifBlank { "真人手动报告" }, "")
+                Toast.makeText(this@AutomationService, "错误报告已保存", Toast.LENGTH_SHORT).show()
+            }
+        })
+        bar.addView(Button(this).apply {
+            text = "停止"
+            setOnClickListener { stopTask(this@AutomationService) }
+        })
+        try {
+            wm.addView(bar, interventionParams(Gravity.TOP, focusable = false))
+            interventionRoot = bar
+            TaskStore.appendLog(this, "真人接管：自动化已暂停，你可以手动操作；处理完点顶部“继续识别”。")
+        } catch (e: Exception) {
+            TaskStore.appendLog(this, "真人操作条打开失败：${e.message}")
+        }
+    }
+
+    fun removeIntervention() {
+        val root = interventionRoot ?: return
+        interventionRoot = null
+        interventionNote = null
+        try {
+            getSystemService(WindowManager::class.java)?.removeView(root)
+        } catch (_: Exception) {
+        }
     }
 
     private fun nodeText(node: AccessibilityNodeInfo): String {
@@ -844,11 +1140,15 @@ class AutomationService : AccessibilityService() {
                     )
                 }
                 removeCalibration()
+                afterSettingOverlayClosed()
             }
         }
         val cancelBtn = Button(this).apply {
             text = "取消"
-            setOnClickListener { removeCalibration() }
+            setOnClickListener {
+                removeCalibration()
+                afterSettingOverlayClosed()
+            }
         }
         val bar = topBar("$platform $kindName：十字圆心对准按键中心", listOf(saveBtn, cancelBtn))
         val nudgeBar = LinearLayout(this).apply {
@@ -905,6 +1205,10 @@ class AutomationService : AccessibilityService() {
             getSystemService(WindowManager::class.java)?.removeView(root)
         } catch (_: Exception) {
         }
+    }
+
+    private fun afterSettingOverlayClosed() {
+        if (pausedForHuman) showManualBar()
     }
 
 
@@ -970,11 +1274,15 @@ class AutomationService : AccessibilityService() {
                     TaskStore.appendLog(this@AutomationService, "记录取消：还没有点任何位置。")
                 }
                 removeCalibration()
+                afterSettingOverlayClosed()
             }
         }
         val cancelBtn = Button(this).apply {
             text = "取消"
-            setOnClickListener { removeCalibration() }
+            setOnClickListener {
+                removeCalibration()
+                afterSettingOverlayClosed()
+            }
         }
         val bar = topBar("记录 $platform 点击：切到 $platform，按顺序点你要点的按键", listOf(doneBtn, cancelBtn))
         root.addView(recorder, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
@@ -994,7 +1302,10 @@ class AutomationService : AccessibilityService() {
     fun runSequence(platform: String, comment: String) {
         val steps = TapSequenceStore.loadSteps(this, platform)
         if (steps.isEmpty()) {
-            TaskStore.appendLog(this, "执行失败：$platform 还没有记录点击，先点“开始记录点击”把位置记下来。")
+            val reason = "执行失败：$platform 还没有记录点击，先点“开始记录点击”把位置记下来。"
+            TaskStore.appendLog(this, reason)
+            saveCurrentErrorReport(this, reason, "")
+            showInterventionPanel(reason)
             return
         }
         val repeat = TapSequenceStore.loadRepeat(this, platform)
@@ -1021,8 +1332,18 @@ class AutomationService : AccessibilityService() {
                 val probe = comment.take(6)
                 val verified = rootInActiveWindow?.let { findEditableCommentBox(it)?.text?.toString()?.contains(probe) } == true
                 TaskStore.appendLog(this, "第 ${index + 1} 步填评论：${if (verified) "已填入并验证" else "已填入，未验证到文字"}")
+                if (!verified) {
+                    val reason = "第 ${index + 1} 步填评论失败：填入后没有验证到文字，已暂停等真人介入。"
+                    saveCurrentErrorReport(this, reason, "")
+                    showInterventionPanel(reason)
+                    return
+                }
             } else {
-                TaskStore.appendLog(this, "第 ${index + 1} 步填评论失败：找不到可填的输入框（先点输入框再填）")
+                val reason = "第 ${index + 1} 步填评论失败：找不到可填的输入框（先点输入框再填），已暂停等真人介入。"
+                TaskStore.appendLog(this, reason)
+                saveCurrentErrorReport(this, reason, "")
+                showInterventionPanel(reason)
+                return
             }
             handler.postDelayed({ execStep(platform, steps, comment, round, repeat, index + 1) }, nextDelay)
             return
@@ -1037,12 +1358,19 @@ class AutomationService : AccessibilityService() {
             done()
             return
         }
-        tapAtFraction(step.x, step.y, "真实点击")
-        handler.postDelayed({ tapTimes(step, remaining - 1, done) }, 380L)
+        tapAtFraction(step.x, step.y, "真实点击") { ok ->
+            if (!ok) {
+                val reason = "真实点击失败：手势没有完成（X ${(step.x * 100).toInt()}% · Y ${(step.y * 100).toInt()}%），已暂停等真人介入。"
+                saveCurrentErrorReport(this, reason, "")
+                showInterventionPanel(reason)
+                return@tapAtFraction
+            }
+            handler.postDelayed({ tapTimes(step, remaining - 1, done) }, 380L)
+        }
     }
 
-    /** 按保存的屏幕比例真实点击一次（手势注入，点的是屏幕坐标）。 */
-    private fun tapAtFraction(x: Float, y: Float, label: String) {
+    /** 按保存的屏幕比例真实点击一次（手势注入，点的是屏幕坐标），并等待系统完成/取消回调。 */
+    private fun tapAtFraction(x: Float, y: Float, label: String, onDone: ((Boolean) -> Unit)? = null) {
         val dm = resources.displayMetrics
         val px = x * dm.widthPixels
         val py = y * dm.heightPixels
@@ -1050,15 +1378,27 @@ class AutomationService : AccessibilityService() {
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0, 60))
             .build()
-        val ok = dispatchGesture(gesture, object : GestureResultCallback() {
+        var finished = false
+        fun finish(ok: Boolean, message: String) {
+            if (finished) return
+            finished = true
+            TaskStore.appendLog(this@AutomationService, message)
+            onDone?.invoke(ok)
+        }
+        val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) {
+                finish(true, "$label：手势已完成（X ${(x * 100).toInt()}% · Y ${(y * 100).toInt()}%）")
+            }
+
             override fun onCancelled(gestureDescription: GestureDescription?) {
-                TaskStore.appendLog(this@AutomationService, "$label：坐标点击被系统取消（X ${(x * 100).toInt()}% · Y ${(y * 100).toInt()}%）")
+                finish(false, "$label：坐标点击被系统取消（X ${(x * 100).toInt()}% · Y ${(y * 100).toInt()}%）")
             }
         }, handler)
-        TaskStore.appendLog(
-            this,
-            "$label：已按配置点位点击（X ${(x * 100).toInt()}% · Y ${(y * 100).toInt()}%）${if (ok) "" else "，手势派发失败"}"
-        )
+        if (!dispatched) {
+            finish(false, "$label：手势派发失败（X ${(x * 100).toInt()}% · Y ${(y * 100).toInt()}%）")
+        } else {
+            TaskStore.appendLog(this, "$label：手势已派发，等待系统完成回调（X ${(x * 100).toInt()}% · Y ${(y * 100).toInt()}%）")
+        }
     }
 
     override fun onInterrupt() {
@@ -1068,6 +1408,7 @@ class AutomationService : AccessibilityService() {
 
     override fun onDestroy() {
         removeCalibration()
+        removeIntervention()
         super.onDestroy()
         instance = null
     }
