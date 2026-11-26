@@ -497,6 +497,13 @@ class AutomationService : AccessibilityService() {
             } else scheduleStep(context, 2500L)
             return
         }
+        if (treeText(root).contains("全部评论") && attempts < 3) {
+            tapAtFraction(0.5f, 0.92f, "步骤5 打开评论区")
+            TaskStore.appendLog(context, "步骤5 打开评论区：页面已有全部评论但输入框没露出来，已点底部评论栏位置…")
+            attempts++
+            scheduleStep(context, 2200L)
+            return
+        }
         if ((expectedPlatform == "抖音" || expectedPlatform == "快手") && attempts < 3) {
             val y = listOf(0.60f, 0.64f, 0.56f)[attempts]
             tapAtFraction(0.925f, y, "步骤5 打开评论区")
@@ -544,7 +551,11 @@ class AutomationService : AccessibilityService() {
         val found = findSendButton(root, input)
         if (found == null && sendStage == 0 && sendWaitAttempts < 3) {
             sendWaitAttempts++
-            if (sendWaitAttempts == 2 && !pasteTried) {
+            if (sendWaitAttempts == 1) {
+                input.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                clickNode(input)
+                TaskStore.appendLog(context, "步骤7 点发送：发送键还没出现，已重新聚焦输入框触发发送键显示…")
+            } else if (sendWaitAttempts == 2 && !pasteTried) {
                 pasteTried = true
                 if (pasteText(input, task.commentText, probe)) {
                     TaskStore.appendLog(context, "步骤7 点发送：发送键还没出现，已用粘贴方式重新填入评论，等待发送键激活…")
@@ -1056,7 +1067,7 @@ class AutomationService : AccessibilityService() {
         val rootBounds = nodeBounds(root)
         val keywords = listOf(
             "说点什么", "写评论", "发评论", "善语结善缘", "发条友善的评论", "Add comment", "发表评论",
-            "留下你的精彩评论", "精彩评论", "写下你的评论", "评论一下", "说点什么吧", "爱评论的人运气都不差"
+            "留下你的精彩评论吧", "留下你的精彩评论", "精彩评论", "写下你的评论", "评论一下", "说点什么吧", "爱评论的人运气都不差"
         )
         var best: AccessibilityNodeInfo? = null
         var bestScore = Int.MIN_VALUE
