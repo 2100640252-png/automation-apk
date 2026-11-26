@@ -1001,7 +1001,7 @@ class AutomationService : AccessibilityService() {
         return null
     }
 
-    private fun tapNodeCenter(node: AccessibilityNodeInfo, label: String, onDone: (() -> Unit)? = null) {
+    private fun tapNodeCenter(node: AccessibilityNodeInfo, label: String, onDone: ((Boolean) -> Unit)? = null) {
         val bounds = nodeBounds(node)
         val dm = resources.displayMetrics
         val x = if (dm.widthPixels > 0) bounds.centerX().toFloat() / dm.widthPixels else 0.9f
