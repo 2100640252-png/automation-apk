@@ -214,6 +214,7 @@ class AutomationService : AccessibilityService() {
                     }
                     expectedPackage = result.packageName
                     expectedPlatform = result.platform
+                    instance?.resetSendState()
                     instance?.scheduleStep(context, 3000L)
                 }
             }.start()
@@ -258,6 +259,8 @@ class AutomationService : AccessibilityService() {
     }
 
     private var attempts: Int = 0
+    private var sendStage: Int = 0
+    private var preSendProbeCount: Int = 0
     private var interventionRoot: View? = null
     private var interventionNote: EditText? = null
 
@@ -316,6 +319,48 @@ class AutomationService : AccessibilityService() {
         return sb.toString()
     }
 
+    private fun commentProbe(task: CommentTask): String {
+        val normalized = task.commentText.trim().replace(Regex("\\s+"), " ")
+        return normalized.take(12).ifBlank { normalized }
+    }
+
+    private fun textOutsideInput(root: AccessibilityNodeInfo, input: AccessibilityNodeInfo?): String {
+        val sb = StringBuilder()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        while (queue.isNotEmpty()) {
+            val n = queue.removeFirst()
+            val isInput = n === input || n.isEditable || n.className?.toString()?.contains("EditText") == true
+            if (!isInput) {
+                n.text?.let { sb.append(it).append(' ') }
+                n.contentDescription?.let { sb.append(it).append(' ') }
+                n.hintText?.let { sb.append(it).append(' ') }
+            }
+            if (!isInput) {
+                for (i in 0 until n.childCount) n.getChild(i)?.let { queue.add(it) }
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun countOccurrences(text: String, probe: String): Int {
+        if (probe.isBlank()) return 0
+        var count = 0
+        var index = 0
+        while (true) {
+            val found = text.indexOf(probe, index)
+            if (found < 0) break
+            count++
+            index = found + probe.length
+        }
+        return count
+    }
+
+    fun resetSendState() {
+        sendStage = 0
+        preSendProbeCount = 0
+    }
+
     private fun tryOneStep(context: Context) {
         if (!running || pausedForHuman) return
         val task = currentTask ?: return
@@ -361,18 +406,33 @@ class AutomationService : AccessibilityService() {
         // 必须先点输入框拿到焦点、填入并验证文字真的进去了，再找发送键。
         val input = findEditableCommentBox(root)
         if (input != null) {
+            val probe = commentProbe(task)
+            val existingText = input.text?.toString() ?: ""
+            if (existingText.contains(probe)) {
+                if (sendStage == 0) {
+                    preSendProbeCount = countOccurrences(textOutsideInput(root, input), probe)
+                    TaskStore.appendLog(context, "步骤6 填评论：输入框里已有评论，直接进入发送（发送前评论区同文案出现 $preSendProbeCount 次）。")
+                    handler.postDelayed({ trySend(context, task) }, 500L)
+                } else {
+                    handler.postDelayed({ verifySent(context, task) }, 500L)
+                }
+                return
+            }
             clickNode(input)
             input.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
             handler.postDelayed({
                 val freshRoot = rootInActiveWindow
                 val freshInput = freshRoot?.let { findEditableCommentBox(it) } ?: input
                 val okSet = setText(freshInput, task.commentText)
-                val probe = task.commentText.take(6)
                 val verified = okSet && (rootInActiveWindow?.let {
                     findEditableCommentBox(it)?.text?.toString()?.contains(probe)
                 } == true)
                 if (verified) {
-                    TaskStore.appendLog(context, "步骤6 填评论：已填入并验证文字在输入框里，正在找发送键…")
+                    sendStage = 0
+                    val rootNow = rootInActiveWindow
+                    val inputNow = rootNow?.let { findEditableCommentBox(it) }
+                    preSendProbeCount = if (rootNow != null) countOccurrences(textOutsideInput(rootNow, inputNow), probe) else 0
+                    TaskStore.appendLog(context, "步骤6 填评论：已填入并验证文字在输入框里，正在找发送键…（发送前评论区同文案出现 $preSendProbeCount 次）")
                     handler.postDelayed({ trySend(context, task) }, 1000L)
                 } else {
                     attempts++
@@ -437,50 +497,80 @@ class AutomationService : AccessibilityService() {
             } else scheduleStep(context, 3000L)
             return
         }
-        // 用户配置了发送点就按保存位置真实点击（优先于自动找键，每个平台按记忆位置点）。
-        val sendPoint = PointStore.load(context, expectedPlatform, PointStore.KIND_SEND)
-        if (sendPoint != null) {
-            tapAtFraction(sendPoint.x, sendPoint.y, "步骤7 点发送")
-            handler.postDelayed({ verifySent(context, task) }, 1800L)
-            return
-        }
         val input = findEditableCommentBox(root)
-        val found = findSendButton(root, input)
-        if (found != null && clickNode(found.first)) {
-            TaskStore.appendLog(context, "步骤7 点发送：已用${found.second}点发送，正在验证…")
-            handler.postDelayed({ verifySent(context, task) }, 1800L)
+        val probe = commentProbe(task)
+        val inputText = input?.text?.toString() ?: ""
+        if (input == null || !inputText.contains(probe)) {
+            TaskStore.appendLog(context, "步骤7 点发送：输入框里没有待发送评论，回到填评论步骤重新确认。")
+            scheduleStep(context, 1200L)
             return
         }
-        // 发送键没找到时，试回车发送（部分平台回车即发送）。
-        if (input != null && input.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)) {
-            TaskStore.appendLog(context, "步骤7 点发送：没找到发送键，已用回车发送，正在验证…")
-            handler.postDelayed({ verifySent(context, task) }, 1800L)
+        // 用户配置了发送点就先按保存位置真实点击；没生效时再换自动找键和回车，不重复假报成功。
+        val sendPoint = PointStore.load(context, expectedPlatform, PointStore.KIND_SEND)
+        if (sendPoint != null && sendStage == 0) {
+            sendStage = 1
+            tapAtFraction(sendPoint.x, sendPoint.y, "步骤7 点发送") {
+                handler.postDelayed({ verifySent(context, task) }, 1500L)
+            }
+            return
+        }
+        val found = findSendButton(root, input)
+        if (found != null && sendStage == 0) {
+            sendStage = 1
+            if (clickNode(found.first)) {
+                TaskStore.appendLog(context, "步骤7 点发送：已用${found.second}点击发送控件，正在验证…")
+                handler.postDelayed({ verifySent(context, task) }, 1500L)
+                return
+            }
+        }
+        if (found != null && sendStage <= 1) {
+            sendStage = 2
+            tapNodeCenter(found.first, "步骤7 点发送") {
+                TaskStore.appendLog(context, "步骤7 点发送：已用${found.second}坐标点击发送控件，正在验证…")
+                handler.postDelayed({ verifySent(context, task) }, 1500L)
+            }
+            return
+        }
+        if (sendStage <= 2 && input.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)) {
+            sendStage = 3
+            TaskStore.appendLog(context, "步骤7 点发送：已用回车发送，正在验证…")
+            handler.postDelayed({ verifySent(context, task) }, 1500L)
             return
         }
         attempts++
-        TaskStore.appendLog(context, "步骤7 点发送：发送键没找到（文字和右下角位置都没找到，第 $attempts 次）")
-        if (attempts >= 3) {
+        TaskStore.appendLog(context, "步骤7 点发送：发送键没找到或点击没生效（第 $attempts 次，发送阶段 $sendStage）")
+        if (attempts >= 3 || sendStage >= 3) {
             attempts = 0
-            interveneCurrent(context, task, "步骤7 失败：找不到发送键（快手/抖音发送键可能是图标，已按右下角位置找过仍没有；去点位页校准发送点后按位置点）")
-        } else scheduleStep(context, 3000L)
+            interveneCurrent(context, task, "步骤7 失败：发送键点击没有生效（已试控件点击、坐标点击和回车；请真人确认发送键位置或校准发送点）")
+        } else scheduleStep(context, 2500L)
     }
 
     private fun verifySent(context: Context, task: CommentTask) {
         if (!running || pausedForHuman) return
         val root = rootInActiveWindow
-        val probe = task.commentText.take(6)
-        val text = root?.let { treeText(it) } ?: ""
+        val probe = commentProbe(task)
         val input = root?.let { findEditableCommentBox(it) }
         val inputText = input?.text?.toString() ?: ""
-        val sent = text.contains(probe) || text.contains("评论成功") || text.contains("发送成功")
-        val inputCleared = input != null && inputText.isBlank()
+        val outsideText = root?.let { textOutsideInput(it, input) } ?: ""
+        val outsideCount = countOccurrences(outsideText, probe)
+        val inputContains = inputText.contains(probe)
+        val inputCleared = input == null || inputText.isBlank() || !inputContains
+        val successWords = outsideText.contains("评论成功") || outsideText.contains("发送成功")
+        val sent = !inputContains && (outsideCount > preSendProbeCount || successWords)
         if (sent) {
-            TaskStore.appendLog(context, "步骤8 验证：评论已发出。")
+            TaskStore.appendLog(context, "步骤8 验证：评论已发出（输入框外同文案从 $preSendProbeCount 次变为 $outsideCount 次）。")
             markItemSuccess(context)
             attempts = 0
             advance(context, task)
+        } else if (inputContains) {
+            TaskStore.appendLog(context, "步骤8 验证：输入框里还有评论，说明还没发出去（发送阶段 $sendStage）。")
+            if (sendStage < 3) {
+                handler.postDelayed({ trySend(context, task) }, 900L)
+            } else {
+                interveneCurrent(context, task, "步骤8 失败：输入框里还有评论，发送点击没有生效（已试控件点击、坐标点击和回车）")
+            }
         } else if (inputCleared) {
-            interveneCurrent(context, task, "步骤8 失败：输入框已清空，但没有在界面上验证到评论出现，已暂停等真人确认，避免重复发送")
+            interveneCurrent(context, task, "步骤8 失败：输入框已清空，但没有在输入框外验证到新评论出现，已暂停等真人确认，避免重复发送")
         } else {
             attempts++
             TaskStore.appendLog(context, "步骤8 验证：没验证到评论发出（第 $attempts 次）")
@@ -552,6 +642,7 @@ class AutomationService : AccessibilityService() {
     private fun advance(context: Context, task: CommentTask) {
         currentIndex++
         attempts = 0
+        resetSendState()
         expectedPackage = null
         pausedForHuman = false
         lastFailureReason = ""
@@ -894,7 +985,31 @@ class AutomationService : AccessibilityService() {
         return null
     }
 
-    /** 找发送键：先按文字找；快手/抖音的发送键常是无文字图标，再按位置找输入框右下角的可点控件。 */
+    private fun nodeBounds(node: AccessibilityNodeInfo): Rect {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        return rect
+    }
+
+    private fun clickableAncestor(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        var cur: AccessibilityNodeInfo? = node
+        repeat(5) {
+            val current = cur ?: return null
+            if (current.isClickable) return current
+            cur = current.parent
+        }
+        return null
+    }
+
+    private fun tapNodeCenter(node: AccessibilityNodeInfo, label: String, onDone: (() -> Unit)? = null) {
+        val bounds = nodeBounds(node)
+        val dm = resources.displayMetrics
+        val x = if (dm.widthPixels > 0) bounds.centerX().toFloat() / dm.widthPixels else 0.9f
+        val y = if (dm.heightPixels > 0) bounds.centerY().toFloat() / dm.heightPixels else 0.9f
+        tapAtFraction(x.coerceIn(0.01f, 0.99f), y.coerceIn(0.01f, 0.99f), label, onDone)
+    }
+
+    /** 找发送键：只认可点击且可用的控件；文字发送键优先，图标发送键按输入框右侧位置匹配。 */
     private fun findSendButton(root: AccessibilityNodeInfo, input: AccessibilityNodeInfo?): Pair<AccessibilityNodeInfo, String>? {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
@@ -903,35 +1018,43 @@ class AutomationService : AccessibilityService() {
         while (queue.isNotEmpty()) {
             val node = queue.removeFirst()
             all.add(node)
-            val text = nodeText(node)
-            if (keywords.any { text.contains(it) }) return node to "文字匹配"
             for (i in 0 until node.childCount) node.getChild(i)?.let { queue.add(it) }
         }
-        val rootBounds = Rect()
-        root.getBoundsInScreen(rootBounds)
-        val inputBounds = Rect()
-        input?.getBoundsInScreen(inputBounds)
-        val inputCenterX = if (input != null) inputBounds.centerX() else rootBounds.centerX()
+        val rootBounds = nodeBounds(root)
+        val inputBounds = input?.let { nodeBounds(it) }
         var best: AccessibilityNodeInfo? = null
-        var bestScore = -1
+        var bestMethod = ""
+        var bestScore = Int.MIN_VALUE
         for (node in all) {
             if (node === input) continue
-            val b = Rect()
-            node.getBoundsInScreen(b)
+            val clickable = clickableAncestor(node) ?: continue
+            if (!clickable.isEnabled) continue
+            val b = nodeBounds(clickable)
             if (b.width() <= 0 || b.height() <= 0) continue
-            val clickable = node.isClickable || node.parent?.isClickable == true
-            if (!clickable) continue
-            if (b.centerY() < rootBounds.height() * 0.5) continue
-            if (b.centerX() <= inputCenterX) continue
-            if (b.width() > rootBounds.width() * 0.35) continue
-            if (b.height() > rootBounds.height() * 0.18) continue
-            val score = b.centerX() + b.centerY()
+            val combinedText = nodeText(node) + " " + nodeText(clickable)
+            val textMatch = keywords.any { combinedText.contains(it) }
+            val nearInput = inputBounds == null ||
+                (b.centerX() > inputBounds.centerX() && kotlin.math.abs(b.centerY() - inputBounds.centerY()) <= maxOf(140, inputBounds.height() * 2))
+            val lowerArea = b.centerY() > rootBounds.height() * 0.45
+            val verticalDistance = if (inputBounds != null) kotlin.math.abs(b.centerY() - inputBounds.centerY()) else 0
+            val score: Int
+            val method: String
+            if (textMatch) {
+                score = 1000 + (if (nearInput) 300 else 0) + (if (lowerArea) 100 else 0) - verticalDistance
+                method = "文字匹配"
+            } else if (nearInput && lowerArea && b.width() <= rootBounds.width() * 0.25 && b.height() <= rootBounds.height() * 0.14) {
+                score = 500 + b.centerX() - verticalDistance
+                method = "输入框右侧图标匹配"
+            } else {
+                continue
+            }
             if (score > bestScore) {
                 bestScore = score
-                best = node
+                best = clickable
+                bestMethod = method
             }
         }
-        return best?.let { it to "右下角位置匹配" }
+        return best?.let { it to bestMethod }
     }
 
     private fun findPublishButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
@@ -953,9 +1076,10 @@ class AutomationService : AccessibilityService() {
 
     private fun clickNode(node: AccessibilityNodeInfo): Boolean {
         var cur: AccessibilityNodeInfo? = node
-        while (cur != null) {
-            if (cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
-            cur = cur.parent
+        repeat(5) {
+            val current = cur ?: return false
+            if (current.isClickable && current.isEnabled && current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            cur = current.parent
         }
         return false
     }
