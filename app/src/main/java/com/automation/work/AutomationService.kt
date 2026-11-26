@@ -2,16 +2,21 @@ package com.automation.work
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.Rect
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.Display
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -261,6 +266,8 @@ class AutomationService : AccessibilityService() {
     private var attempts: Int = 0
     private var sendStage: Int = 0
     private var sendWaitAttempts: Int = 0
+    private var pasteTried: Boolean = false
+    private var lastVisionSummary: String = "未使用截图视觉兜底"
     private var preSendProbeCount: Int = 0
     private var interventionRoot: View? = null
     private var interventionNote: EditText? = null
@@ -360,6 +367,8 @@ class AutomationService : AccessibilityService() {
     fun resetSendState() {
         sendStage = 0
         sendWaitAttempts = 0
+        pasteTried = false
+        lastVisionSummary = "未使用截图视觉兜底"
         preSendProbeCount = 0
     }
 
@@ -425,10 +434,7 @@ class AutomationService : AccessibilityService() {
             handler.postDelayed({
                 val freshRoot = rootInActiveWindow
                 val freshInput = freshRoot?.let { findEditableCommentBox(it) } ?: input
-                val okSet = setText(freshInput, task.commentText)
-                val verified = okSet && (rootInActiveWindow?.let {
-                    findEditableCommentBox(it)?.text?.toString()?.contains(probe)
-                } == true)
+                val verified = fillCommentText(freshInput, task.commentText, probe)
                 if (verified) {
                     sendStage = 0
                     sendWaitAttempts = 0
@@ -491,9 +497,10 @@ class AutomationService : AccessibilityService() {
             } else scheduleStep(context, 2500L)
             return
         }
-        if ((expectedPlatform == "抖音" || expectedPlatform == "快手") && attempts < 2) {
-            tapAtFraction(0.925f, 0.62f, "步骤5 打开评论区")
-            TaskStore.appendLog(context, "步骤5 打开评论区：界面没暴露评论入口，已按$expectedPlatform 右侧评论图标位置坐标点击…")
+        if ((expectedPlatform == "抖音" || expectedPlatform == "快手") && attempts < 3) {
+            val y = listOf(0.60f, 0.64f, 0.56f)[attempts]
+            tapAtFraction(0.925f, y, "步骤5 打开评论区")
+            TaskStore.appendLog(context, "步骤5 打开评论区：界面没暴露评论入口，已按$expectedPlatform 右侧评论图标位置坐标点击（y=$y）…")
             attempts++
             scheduleStep(context, 2500L)
             return
@@ -537,7 +544,14 @@ class AutomationService : AccessibilityService() {
         val found = findSendButton(root, input)
         if (found == null && sendStage == 0 && sendWaitAttempts < 3) {
             sendWaitAttempts++
-            TaskStore.appendLog(context, "步骤7 点发送：发送键还没出现，等键盘和发送键稳定后重试（第 $sendWaitAttempts 次）…")
+            if (sendWaitAttempts == 2 && !pasteTried) {
+                pasteTried = true
+                if (pasteText(input, task.commentText, probe)) {
+                    TaskStore.appendLog(context, "步骤7 点发送：发送键还没出现，已用粘贴方式重新填入评论，等待发送键激活…")
+                }
+            } else {
+                TaskStore.appendLog(context, "步骤7 点发送：发送键还没出现，等键盘和发送键稳定后重试（第 $sendWaitAttempts 次）…")
+            }
             handler.postDelayed({ trySend(context, task) }, 1300L)
             return
         }
@@ -568,14 +582,29 @@ class AutomationService : AccessibilityService() {
             }
             2 -> {
                 sendStage = 3
+                findSendByScreenshot(input) { point ->
+                    if (point != null) {
+                        tapAtFraction(point.first, point.second, "步骤7 点发送") {
+                            TaskStore.appendLog(context, "步骤7 点发送：已按截图视觉找到的发送图标点击，正在验证…")
+                            handler.postDelayed({ verifySent(context, task) }, 1600L)
+                        }
+                    } else {
+                        TaskStore.appendLog(context, "步骤7 点发送：截图视觉没找到发送图标，改用输入框右侧位置…")
+                        handler.postDelayed({ trySend(context, task) }, 300L)
+                    }
+                }
+                return
+            }
+            3 -> {
+                sendStage = 4
                 tapInputRight(input, "步骤7 点发送") {
                     TaskStore.appendLog(context, "步骤7 点发送：已按输入框右侧发送图标位置点击，正在验证…")
                     handler.postDelayed({ verifySent(context, task) }, 1600L)
                 }
                 return
             }
-            3 -> {
-                sendStage = 4
+            4 -> {
+                sendStage = 5
                 if (input.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)) {
                     TaskStore.appendLog(context, "步骤7 点发送：已用回车发送，正在验证…")
                     handler.postDelayed({ verifySent(context, task) }, 1600L)
@@ -585,9 +614,9 @@ class AutomationService : AccessibilityService() {
         }
         attempts++
         TaskStore.appendLog(context, "步骤7 点发送：发送键没找到或点击没生效（第 $attempts 次，发送阶段 $sendStage）")
-        if (attempts >= 3 || sendStage >= 4) {
+        if (attempts >= 3 || sendStage >= 5) {
             attempts = 0
-            interveneCurrent(context, task, "步骤7 失败：发送键点击没有生效（已试控件点击、发送键坐标、输入框右侧位置和回车；请真人确认发送键位置或校准发送点）")
+            interveneCurrent(context, task, "步骤7 失败：发送键点击没有生效（已试控件点击、发送键坐标、截图视觉、输入框右侧位置和回车；请真人确认发送键位置或校准发送点）")
         } else scheduleStep(context, 2500L)
     }
 
@@ -610,10 +639,10 @@ class AutomationService : AccessibilityService() {
             advance(context, task)
         } else if (inputContains) {
             TaskStore.appendLog(context, "步骤8 验证：输入框里还有评论，说明还没发出去（发送阶段 $sendStage）。")
-            if (sendStage < 4) {
+            if (sendStage < 5) {
                 handler.postDelayed({ trySend(context, task) }, 900L)
             } else {
-                interveneCurrent(context, task, "步骤8 失败：输入框里还有评论，发送点击没有生效（已试控件点击、发送键坐标、输入框右侧位置和回车）")
+                interveneCurrent(context, task, "步骤8 失败：输入框里还有评论，发送点击没有生效（已试控件点击、发送键坐标、截图视觉、输入框右侧位置和回车）")
             }
         } else if (inputCleared) {
             interveneCurrent(context, task, "步骤8 失败：输入框已清空，但没有在输入框外验证到新评论出现，已暂停等真人确认，避免重复发送")
@@ -768,6 +797,8 @@ class AutomationService : AccessibilityService() {
                 appendLine("视频文案：$publishCaption")
             }
             if (userNote.isNotBlank()) appendLine("真人补充：$userNote")
+            appendLine("发送状态：阶段=$sendStage 等待次数=$sendWaitAttempts 粘贴兜底=$pasteTried")
+            appendLine("截图视觉摘要：$lastVisionSummary")
             appendLine("页面文字摘要：$pageText")
             appendLine("控件摘要：")
             append(nodeSummary(root))
@@ -987,7 +1018,8 @@ class AutomationService : AccessibilityService() {
     private fun nodeText(node: AccessibilityNodeInfo): String {
         return (node.text?.toString() ?: "") + " " +
             (node.contentDescription?.toString() ?: "") + " " +
-            (node.hintText?.toString() ?: "")
+            (node.hintText?.toString() ?: "") + " " +
+            (node.viewIdResourceName ?: "")
     }
 
     private fun findEditableCommentBox(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
@@ -1115,6 +1147,92 @@ class AutomationService : AccessibilityService() {
         tapAtFraction(x.coerceIn(0.01f, 0.99f), y.coerceIn(0.01f, 0.99f), label, onDone)
     }
 
+    private fun findSendByScreenshot(input: AccessibilityNodeInfo, onResult: (Pair<Float, Float>?) -> Unit) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            lastVisionSummary = "截图视觉不可用：系统版本低于 Android 11"
+            onResult(null)
+            return
+        }
+        val inputBounds = nodeBounds(input)
+        try {
+            takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                java.util.concurrent.Executors.newSingleThreadExecutor(),
+                object : AccessibilityService.TakeScreenshotCallback {
+                    override fun onSuccess(screenshot: AccessibilityService.ScreenshotResult) {
+                        var point: Pair<Float, Float>? = null
+                        try {
+                            val hardwareBitmap = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
+                            val bitmap = hardwareBitmap?.copy(Bitmap.Config.ARGB_8888, false)
+                            if (bitmap != null) {
+                                point = findRedSendIcon(bitmap, inputBounds)
+                                bitmap.recycle()
+                            } else {
+                                lastVisionSummary = "截图视觉失败：截图转成可读图片失败"
+                            }
+                            hardwareBitmap?.recycle()
+                        } catch (e: Exception) {
+                            lastVisionSummary = "截图视觉失败：${e.message}"
+                        } finally {
+                            try {
+                                screenshot.hardwareBuffer.close()
+                            } catch (_: Exception) {
+                            }
+                        }
+                        handler.post { onResult(point) }
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        lastVisionSummary = "截图视觉失败：系统截图错误码 $errorCode"
+                        handler.post { onResult(null) }
+                    }
+                }
+            )
+        } catch (e: Exception) {
+            lastVisionSummary = "截图视觉失败：${e.message}"
+            onResult(null)
+        }
+    }
+
+    private fun findRedSendIcon(bitmap: Bitmap, inputBounds: Rect): Pair<Float, Float>? {
+        val width = bitmap.width
+        val height = bitmap.height
+        if (width <= 0 || height <= 0) return null
+        val xStart = maxOf(0, inputBounds.right - (width * 0.24f).toInt())
+        val xEnd = width
+        val yStart = maxOf(0, inputBounds.centerY() - (height * 0.09f).toInt())
+        val yEnd = minOf(height, inputBounds.centerY() + (height * 0.09f).toInt())
+        var count = 0
+        var sumX = 0L
+        var sumY = 0L
+        val step = 3
+        var y = yStart
+        while (y < yEnd) {
+            var x = xStart
+            while (x < xEnd) {
+                val pixel = bitmap.getPixel(x, y)
+                val r = Color.red(pixel)
+                val g = Color.green(pixel)
+                val b = Color.blue(pixel)
+                if (r > 165 && g < 115 && b < 135 && r - g > 65) {
+                    count++
+                    sumX += x
+                    sumY += y
+                }
+                x += step
+            }
+            y += step
+        }
+        if (count < 25) {
+            lastVisionSummary = "截图视觉：输入框右侧没找到红色发送图标（红色像素样本=$count）"
+            return null
+        }
+        val cx = (sumX / count).toFloat() / width
+        val cy = (sumY / count).toFloat() / height
+        lastVisionSummary = "截图视觉：找到红色发送图标候选 x=${"%.3f".format(cx)} y=${"%.3f".format(cy)} 红色像素样本=$count"
+        return cx.coerceIn(0.01f, 0.99f) to cy.coerceIn(0.01f, 0.99f)
+    }
+
     /** 找发送键：只认可点击且可用的控件；文字发送键优先，图标发送键按输入框右侧位置匹配。 */
     private fun findSendButton(root: AccessibilityNodeInfo, input: AccessibilityNodeInfo?): Pair<AccessibilityNodeInfo, String>? {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
@@ -1202,6 +1320,30 @@ class AutomationService : AccessibilityService() {
             text
         )
         return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    }
+
+    private fun inputContains(node: AccessibilityNodeInfo, probe: String): Boolean {
+        return node.text?.toString()?.contains(probe) == true
+    }
+
+    private fun pasteText(node: AccessibilityNodeInfo, text: String, probe: String): Boolean {
+        return try {
+            val clipboard = getSystemService(ClipboardManager::class.java) ?: return false
+            clipboard.setPrimaryClip(ClipData.newPlainText("automation_comment", text))
+            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+            val pasted = node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+            pasted && inputContains(node, probe)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun fillCommentText(node: AccessibilityNodeInfo, text: String, probe: String): Boolean {
+        if (setText(node, text) && inputContains(node, probe)) return true
+        val fresh = rootInActiveWindow?.let { findEditableCommentBox(it) } ?: node
+        if (inputContains(fresh, probe)) return true
+        pasteTried = true
+        return pasteText(fresh, text, probe)
     }
 
     // ---------- 点位校准浮窗与坐标点击 ----------
