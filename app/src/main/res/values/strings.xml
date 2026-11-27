@@ -2,4 +2,5 @@
 <resources>
     <string name="app_name">自动化工作</string>
     <string name="accessibility_description">用于在你开始任务后，辅助打开视频链接、定位评论框并协助发布评论。只在你主动开始任务时工作，可随时在设置里关闭。</string>
+    <string name="accessibility_script_description">用于无障碍模式：按你配置的点位打开评论区、填入评论并发布，只在你主动开始时工作。</string>
 </resources>

@@ -268,6 +268,21 @@ class MainActivity : ComponentActivity() {
         refreshLog()
     }
 
+    fun openAccessibilitySettings() {
+        startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+    }
+
+    fun runAccessibilityComment(link: String, text: String) {
+        val service = AccessibilityScriptService.instance
+        if (service == null) {
+            taskStatus = "无障碍脚本没开启：先到系统设置 > 无障碍里打开“无障碍脚本”。"
+            return
+        }
+        taskStatus = "无障碍模式执行中：打开链接、进评论区、填评论、发布并验证…"
+        service.runCommentFlow(link, text)
+        refreshLog()
+    }
+
     fun pairAdb(code: String) {
         if (code.isBlank()) { taskStatus = "先输入无线调试页面显示的配对码。"; return }
         taskStatus = "正在配对内置 ADB：保持在配对码页面不要退出…"
@@ -754,6 +769,12 @@ fun AutomationApp(activity: MainActivity) {
             )
             Spacer(Modifier.height(8.dp))
             Button(onClick = { activity.openLinkOnly(link) }, modifier = Modifier.fillMaxWidth()) { Text("直接打开链接") }
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { activity.openAccessibilitySettings() }, modifier = Modifier.weight(1f)) { Text("开启无障碍脚本") }
+                Button(onClick = { activity.runAccessibilityComment(link, pasteText) }, modifier = Modifier.weight(1f)) { Text("无障碍发布评论") }
+            }
+            Text("无障碍模式用上面的链接和下面的评论内容；评论/发布点位用脚本里命名含“评论”“发送/发布”的点位兜底。")
 
             Spacer(Modifier.height(16.dp))
             Text("脚本点位", style = MaterialTheme.typography.titleMedium)

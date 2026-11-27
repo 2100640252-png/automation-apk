@@ -6,9 +6,6 @@ import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
 import com.flyfishxu.kadb.Kadb
 import com.flyfishxu.kadb.cert.KadbCert
-import com.flyfishxu.kadb.cert.KadbCertPolicy
-import com.flyfishxu.kadb.cert.OkioFilePrivateKeyStore
-import okio.Path.Companion.toPath
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -29,13 +26,15 @@ object AdbWirelessHelper {
         if (configured) return
         synchronized(this) {
             if (configured) return
-            val keyFile = File(context.filesDir, "adb_private_key.pem")
-            KadbCert.configure(
-                store = OkioFilePrivateKeyStore(privateKeyPath = keyFile.absolutePath.toPath()),
-                policy = KadbCertPolicy(),
-                additionalPrivateKeysPem = emptyList()
-            )
-            KadbCert.ensureReady()
+            val certFile = File(context.filesDir, "adb_cert.pem")
+            val keyFile = File(context.filesDir, "adb_key.pem")
+            if (certFile.exists() && keyFile.exists()) {
+                KadbCert.set(certFile.readBytes(), keyFile.readBytes())
+            } else {
+                val (cert, key) = KadbCert.get()
+                certFile.writeBytes(cert)
+                keyFile.writeBytes(key)
+            }
             configured = true
         }
     }

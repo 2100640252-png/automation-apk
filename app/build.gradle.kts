@@ -12,8 +12,8 @@ android {
         applicationId = "com.automation.work"
         minSdk = 26
         targetSdk = 34
-        versionCode = 28
-        versionName = "4.1.0"
+        versionCode = 29
+        versionName = "4.2.0"
     }
 
     // 固定签名（v1.4 新增）：用同一把签名钥匙签每一个 Release 包，
@@ -74,6 +74,7 @@ dependencies {
     // 必须有它，App 启动时系统才会初始化 Shizuku；缺了它一点开就闪退（v1.7.0 的 bug）。
     implementation("dev.rikka.shizuku:provider:12.1.0")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
-    implementation("com.flyfishxu:kadb:2.1.1")
+    implementation("com.flyfishxu:kadb:1.3.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     debugImplementation("androidx.compose.ui:ui-tooling:1.7.2")
 }
