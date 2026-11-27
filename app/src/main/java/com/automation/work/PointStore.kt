@@ -18,11 +18,11 @@ object PointStore {
 
     private fun key(platform: String, kind: String, axis: String) = "${platform}_${kind}_$axis"
 
-    fun save(context: Context, platform: String, kind: String, x: Float, y: Float) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+    fun save(context: Context, platform: String, kind: String, x: Float, y: Float): Boolean {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putFloat(key(platform, kind, "x"), x.coerceIn(0f, 1f))
             .putFloat(key(platform, kind, "y"), y.coerceIn(0f, 1f))
-            .apply()
+            .commit()
     }
 
     fun load(context: Context, platform: String, kind: String): TapPoint? {

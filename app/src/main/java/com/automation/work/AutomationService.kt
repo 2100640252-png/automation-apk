@@ -1001,7 +1001,8 @@ class AutomationService : AccessibilityService() {
 
     private fun updateInterventionPanel() {
         val platform = platformForIntervention()
-        interventionStatus?.text = "实时状态：$lastStatus\n校准平台：$platform · 评论点 ${PointStore.describe(this, platform, PointStore.KIND_COMMENT)} · 发送点 ${PointStore.describe(this, platform, PointStore.KIND_SEND)}"
+        val lastLog = TaskStore.loadLog(this).lines().lastOrNull { it.isNotBlank() } ?: "暂无日志"
+        interventionStatus?.text = "实时状态：$lastStatus\n最新日志：$lastLog\n校准平台：$platform · 评论点 ${PointStore.describe(this, platform, PointStore.KIND_COMMENT)} · 发送点 ${PointStore.describe(this, platform, PointStore.KIND_SEND)}"
         val root = rootInActiveWindow
         val pkg = root?.packageName?.toString() ?: "拿不到窗口"
         val txt = root?.let { treeText(it).replace(Regex("\\s+"), " ").trim().take(180) } ?: ""
@@ -1569,14 +1570,23 @@ class AutomationService : AccessibilityService() {
         val saveBtn = Button(this).apply {
             text = "保存点位"
             setOnClickListener {
-                if (root.width > 0 && root.height > 0) {
-                    val fx = cross.cx / root.width
-                    val fy = cross.cy / root.height
-                    PointStore.save(this@AutomationService, platform, kind, fx, fy)
+                if (root.width <= 0 || root.height <= 0) {
+                    Toast.makeText(this@AutomationService, "校准窗还没准备好，先等一下再保存", Toast.LENGTH_SHORT).show()
+                    return@setOnClickListener
+                }
+                val fx = cross.cx / root.width
+                val fy = cross.cy / root.height
+                val savedOk = PointStore.save(this@AutomationService, platform, kind, fx, fy)
+                val verified = PointStore.load(this@AutomationService, platform, kind)
+                if (savedOk && verified != null) {
                     TaskStore.appendLog(
                         this@AutomationService,
-                        "点位已保存：$platform $kindName X ${(fx * 100).toInt()}% · Y ${(fy * 100).toInt()}%，以后评论按这个位置点。"
+                        "点位已保存并验证：$platform $kindName X ${(verified.x * 100).toInt()}% · Y ${(verified.y * 100).toInt()}%，以后评论按这个位置点。"
                     )
+                    Toast.makeText(this@AutomationService, "点位已保存：$platform $kindName", Toast.LENGTH_SHORT).show()
+                } else {
+                    TaskStore.appendLog(this@AutomationService, "点位保存失败：$platform $kindName 没写进去")
+                    Toast.makeText(this@AutomationService, "点位保存失败", Toast.LENGTH_SHORT).show()
                 }
                 removeCalibration()
                 afterSettingOverlayClosed()
@@ -1647,7 +1657,7 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun afterSettingOverlayClosed() {
-        if (pausedForHuman) showManualBar()
+        if (pausedForHuman) showInterventionPanel(lastFailureReason.ifBlank { "悬浮控制窗：点位和状态已更新" })
     }
 
 

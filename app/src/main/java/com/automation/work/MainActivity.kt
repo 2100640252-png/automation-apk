@@ -623,7 +623,7 @@ fun AutomationApp(activity: MainActivity) {
     var commentText by remember { mutableStateOf(savedInputs.second) }
     var intervalText by remember { mutableStateOf(savedInputs.third.ifBlank { "10" }) }
     var caption by remember { mutableStateOf("") }
-    var platform by remember { mutableStateOf("快手") }
+    var platform by remember { mutableStateOf("抖音") }
     var stepsRefresh by remember { mutableStateOf(0) }
     var repeatText by remember { mutableStateOf(TapSequenceStore.loadRepeat(activity, platform).toString()) }
     val platforms = listOf("抖音", "快手", "小红书", "视频号", "哔哩哔哩", "TikTok", "YouTube", "微博")
@@ -681,6 +681,7 @@ fun AutomationApp(activity: MainActivity) {
                     Text("自动化控制中心", color = Color.White, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(6.dp))
                     Text("状态：${activity.taskStatus}", color = Color(0xFFCBD5E1))
+                    Text("无障碍：${if (activity.accessibilityOn) "已开启" else "未开启，悬浮窗和自动点击需要先开启"}", color = Color(0xFFFDE68A))
                     Text("$platform 点位记忆：评论点 ${PointStore.describe(activity, platform, PointStore.KIND_COMMENT)} · 发送点 ${PointStore.describe(activity, platform, PointStore.KIND_SEND)}", color = Color(0xFF93C5FD))
                     Spacer(Modifier.height(12.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
