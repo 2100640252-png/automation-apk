@@ -243,7 +243,7 @@ class ScriptOverlayService : Service() {
                     ScriptStore.TYPE_PASTE -> InputEngine.paste(this, step.text.ifBlank { ScriptStore.loadText(this) })
                     else -> false
                 }
-                TaskStore.appendLog(this, "脚本第 ${i + 1} 步 ${step.name}：${if (ok) "已执行" else "失败，输入层不可用或命令失败"}")
+                TaskStore.appendLog(this, "脚本第 ${i + 1} 步 ${step.name}：${if (ok) "已执行" else "失败"}；${InputEngine.lastResult}")
                 if (!ok) break
                 Thread.sleep(450)
             }

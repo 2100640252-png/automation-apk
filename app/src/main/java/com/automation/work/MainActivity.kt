@@ -21,6 +21,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -263,6 +265,30 @@ class MainActivity : ComponentActivity() {
         }
         startService(Intent(this, ScriptOverlayService::class.java))
         taskStatus = "悬浮脚本已打开：右侧脚本按钮可拖动，点它展开。"
+        refreshLog()
+    }
+
+    fun testShizukuInput(x: Int, y: Int) {
+        taskStatus = "正在测试 Shizuku：先查 uid，再真实点一次检测按钮…"
+        Thread {
+            val (ok, message) = InputEngine.shizukuSelfTest()
+            TaskStore.appendLog(this, "Shizuku 自测：$message")
+            if (!ok) {
+                runOnUiThread { taskStatus = message; refreshLog() }
+                return@Thread
+            }
+            val tapped = InputEngine.tap(x, y)
+            TaskStore.appendLog(this, "Shizuku 触发测试：${InputEngine.lastResult}")
+            runOnUiThread {
+                taskStatus = if (tapped) "已发出真实点击，等检测按钮回显。" else "Shizuku 点击失败：${InputEngine.lastResult}"
+                refreshLog()
+            }
+        }.start()
+    }
+
+    fun onShizukuTriggerDetected() {
+        taskStatus = "Shizuku 输入已真实触发：检测按钮被脚本点到了。"
+        TaskStore.appendLog(this, taskStatus)
         refreshLog()
     }
 
@@ -672,6 +698,20 @@ fun AutomationApp(activity: MainActivity) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(onClick = { ShizukuHelper.requestPermission() }, modifier = Modifier.weight(1f)) { Text("申请 Shizuku 授权") }
                         OutlinedButton(onClick = { activity.openShizukuApp() }, modifier = Modifier.weight(1f)) { Text("打开 Shizuku") }
+                    }
+                    var testX by remember { mutableStateOf(0) }
+                    var testY by remember { mutableStateOf(0) }
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { activity.testShizukuInput(testX, testY) }, modifier = Modifier.weight(1f)) { Text("测试 Shizuku 触发") }
+                        OutlinedButton(
+                            onClick = { activity.onShizukuTriggerDetected() },
+                            modifier = Modifier.weight(1f).onGloballyPositioned { coords ->
+                                val pos = coords.positionInRoot()
+                                testX = (pos.x + coords.size.width / 2).toInt()
+                                testY = (pos.y + coords.size.height / 2).toInt()
+                            }
+                        ) { Text("触发检测按钮") }
                     }
                 }
             }
