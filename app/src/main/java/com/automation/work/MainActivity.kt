@@ -268,26 +268,41 @@ class MainActivity : ComponentActivity() {
         refreshLog()
     }
 
-    fun testShizukuInput(x: Int, y: Int) {
-        taskStatus = "正在测试 Shizuku：先查 uid，再真实点一次检测按钮…"
+    fun pairAdb(code: String) {
+        if (code.isBlank()) { taskStatus = "先输入无线调试页面显示的配对码。"; return }
+        taskStatus = "正在配对内置 ADB：保持在配对码页面不要退出…"
         Thread {
-            val (ok, message) = InputEngine.shizukuSelfTest()
-            TaskStore.appendLog(this, "Shizuku 自测：$message")
+            val (ok, message) = AdbWirelessHelper.pair(this, code)
+            TaskStore.appendLog(this, message)
+            runOnUiThread { taskStatus = message; refreshLog() }
+        }.start()
+    }
+
+    fun testInput(x: Int, y: Int) {
+        taskStatus = "正在测试输入层：先查 uid，再真实点一次检测按钮…"
+        Thread {
+            val (ok, message) = if (AdbWirelessHelper.isPaired(this)) {
+                InputEngine.adbSelfTest(this)
+            } else {
+                val (sok, smsg) = ShizukuHelper.checkShizuku()
+                sok to smsg
+            }
+            TaskStore.appendLog(this, "输入自测：$message")
             if (!ok) {
                 runOnUiThread { taskStatus = message; refreshLog() }
                 return@Thread
             }
-            val tapped = InputEngine.tap(x, y)
-            TaskStore.appendLog(this, "Shizuku 触发测试：${InputEngine.lastResult}")
+            val tapped = InputEngine.tap(this, x, y)
+            TaskStore.appendLog(this, "触发测试：${InputEngine.lastResult}")
             runOnUiThread {
-                taskStatus = if (tapped) "已发出真实点击，等检测按钮回显。" else "Shizuku 点击失败：${InputEngine.lastResult}"
+                taskStatus = if (tapped) "已发出真实点击，等检测按钮回显。" else "点击失败：${InputEngine.lastResult}"
                 refreshLog()
             }
         }.start()
     }
 
     fun onShizukuTriggerDetected() {
-        taskStatus = "Shizuku 输入已真实触发：检测按钮被脚本点到了。"
+        taskStatus = "输入已真实触发：检测按钮被脚本点到了。"
         TaskStore.appendLog(this, taskStatus)
         refreshLog()
     }
@@ -687,7 +702,7 @@ fun AutomationApp(activity: MainActivity) {
                     Text("链接直开 + 悬浮脚本", color = Color.White, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(6.dp))
                     Text("状态：${activity.taskStatus}", color = Color(0xFFCBD5E1))
-                    Text("输入层：${InputEngine.backendName()}", color = Color(0xFF93C5FD))
+                    Text("输入层：${InputEngine.backendName(activity)}", color = Color(0xFF93C5FD))
                     Text("已记点位：${steps.size} 个", color = Color(0xFFFDE68A))
                     Spacer(Modifier.height(12.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -699,11 +714,23 @@ fun AutomationApp(activity: MainActivity) {
                         OutlinedButton(onClick = { ShizukuHelper.requestPermission() }, modifier = Modifier.weight(1f)) { Text("申请 Shizuku 授权") }
                         OutlinedButton(onClick = { activity.openShizukuApp() }, modifier = Modifier.weight(1f)) { Text("打开 Shizuku") }
                     }
+                    var pairCode by remember { mutableStateOf("") }
+                    Spacer(Modifier.height(8.dp))
+                    Text("内置无线 ADB：打开开发者选项 > 无线调试 > 使用配对码配对，把配对码填这里", color = Color(0xFFCBD5E1))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = pairCode,
+                            onValueChange = { pairCode = it },
+                            label = { Text("配对码") },
+                            modifier = Modifier.weight(1f)
+                        )
+                        Button(onClick = { activity.pairAdb(pairCode) }, modifier = Modifier.weight(1f)) { Text("配对内置 ADB") }
+                    }
                     var testX by remember { mutableStateOf(0) }
                     var testY by remember { mutableStateOf(0) }
                     Spacer(Modifier.height(8.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { activity.testShizukuInput(testX, testY) }, modifier = Modifier.weight(1f)) { Text("测试 Shizuku 触发") }
+                        Button(onClick = { activity.testInput(testX, testY) }, modifier = Modifier.weight(1f)) { Text("测试输入触发") }
                         OutlinedButton(
                             onClick = { activity.onShizukuTriggerDetected() },
                             modifier = Modifier.weight(1f).onGloballyPositioned { coords ->

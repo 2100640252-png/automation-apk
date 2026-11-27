@@ -156,7 +156,7 @@ class ScriptOverlayService : Service() {
     private fun refreshStatus() {
         val steps = ScriptStore.loadSteps(this)
         val names = steps.mapIndexed { i, s -> "${i + 1}.${s.name}" }.joinToString("  ")
-        setStatus("输入：${InputEngine.backendName()}\n点位：${steps.size} 个 $names")
+        setStatus("输入：${InputEngine.backendName(this)}\n点位：${steps.size} 个 $names")
     }
 
     private fun setStatus(text: String) {
@@ -234,9 +234,9 @@ class ScriptOverlayService : Service() {
             for ((i, step) in steps.withIndex()) {
                 if (!running) break
                 val ok = when (step.type) {
-                    ScriptStore.TYPE_TAP -> InputEngine.tap((step.x * dm.widthPixels).toInt(), (step.y * dm.heightPixels).toInt())
+                    ScriptStore.TYPE_TAP -> InputEngine.tap(this, (step.x * dm.widthPixels).toInt(), (step.y * dm.heightPixels).toInt())
                     ScriptStore.TYPE_SWIPE -> InputEngine.swipe(
-                        (step.x * dm.widthPixels).toInt(), (step.y * dm.heightPixels).toInt(),
+                        this, (step.x * dm.widthPixels).toInt(), (step.y * dm.heightPixels).toInt(),
                         (step.x2 * dm.widthPixels).toInt(), (step.y2 * dm.heightPixels).toInt(), step.durationMs
                     )
                     ScriptStore.TYPE_WAIT -> { Thread.sleep(step.durationMs.toLong().coerceAtLeast(100)); true }
