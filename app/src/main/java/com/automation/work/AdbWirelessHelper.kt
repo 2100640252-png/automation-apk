@@ -80,7 +80,7 @@ object AdbWirelessHelper {
             configure(context)
             val endpoint = discover(context, SERVICE_PAIRING)
                 ?: return false to "没找到配对服务：请打开无线调试的“使用配对码配对”页面，停在显示配对码的界面再点配对。"
-            Kadb.pair(endpoint.first, endpoint.second, code.trim())
+            kotlinx.coroutines.runBlocking { Kadb.pair(endpoint.first, endpoint.second, code.trim()) }
             context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean(KEY_PAIRED, true).apply()
             closeConnection()
             true to "内置 ADB 配对成功：${endpoint.first}:${endpoint.second}"
