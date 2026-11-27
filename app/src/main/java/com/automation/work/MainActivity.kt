@@ -11,14 +11,18 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import java.io.File
 import java.io.FileOutputStream
@@ -263,7 +267,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         AutomationService.showInterventionNow(this)
-        taskStatus = "真人介入窗已打开：可以手动操作、重新识别、保存错误报告。"
+        taskStatus = "悬浮控制窗已打开：可以手动操作、校准点位、重新识别、保存错误报告。"
         refreshLog()
     }
 
@@ -669,6 +673,25 @@ fun AutomationApp(activity: MainActivity) {
                 Spacer(Modifier.height(12.dp))
             }
 
+            Card(
+                Modifier.fillMaxWidth().background(Color(0xFF0F172A), RoundedCornerShape(18.dp)),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A))
+            ) {
+                Column(Modifier.padding(18.dp)) {
+                    Text("自动化控制中心", color = Color.White, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(6.dp))
+                    Text("状态：${activity.taskStatus}", color = Color(0xFFCBD5E1))
+                    Text("$platform 点位记忆：评论点 ${PointStore.describe(activity, platform, PointStore.KIND_COMMENT)} · 发送点 ${PointStore.describe(activity, platform, PointStore.KIND_SEND)}", color = Color(0xFF93C5FD))
+                    Spacer(Modifier.height(12.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { activity.showIntervention() }, modifier = Modifier.weight(1f)) { Text("打开悬浮控制窗") }
+                        Button(onClick = { activity.startCommentTask(links.toList(), commentText, intervalText.toIntOrNull() ?: 10) }, modifier = Modifier.weight(1f)) { Text("开始评论") }
+                        OutlinedButton(onClick = { activity.stopCommentTask() }, modifier = Modifier.weight(1f)) { Text("停止") }
+                    }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
+
             Text("链接：填完一个，下一个自动出现；下一个不填就截止", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
             links.forEachIndexed { index, value ->
@@ -828,7 +851,7 @@ fun AutomationApp(activity: MainActivity) {
             Text("错误报告：", style = MaterialTheme.typography.titleSmall)
             Text(activity.errorReportText, modifier = Modifier.fillMaxWidth().height(150.dp).verticalScroll(rememberScrollState()))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { activity.showIntervention() }, modifier = Modifier.weight(1f)) { Text("打开真人介入窗") }
+                OutlinedButton(onClick = { activity.showIntervention() }, modifier = Modifier.weight(1f)) { Text("打开悬浮控制窗") }
                 OutlinedButton(onClick = { activity.copyErrorReport() }, modifier = Modifier.weight(1f)) { Text("复制错误报告") }
                 TextButton(onClick = { activity.clearErrorReports() }, modifier = Modifier.weight(1f)) { Text("清空报告") }
             }

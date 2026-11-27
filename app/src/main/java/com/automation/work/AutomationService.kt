@@ -271,6 +271,10 @@ class AutomationService : AccessibilityService() {
     private var preSendProbeCount: Int = 0
     private var interventionRoot: View? = null
     private var interventionNote: EditText? = null
+    private var interventionStatus: TextView? = null
+    private var interventionSnapshot: TextView? = null
+    private var panelRefreshScheduled: Boolean = false
+    private var overlayPlatform: String = "抖音"
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -775,7 +779,7 @@ class AutomationService : AccessibilityService() {
         if (publishRunning && publishPlatform.isNotBlank()) return publishPlatform
         if (expectedPlatform.isNotBlank()) return expectedPlatform
         val itemPlatform = currentTask?.items?.getOrNull(currentIndex)?.platform ?: ""
-        return itemPlatform.ifBlank { "快手" }
+        return itemPlatform.ifBlank { overlayPlatform }
     }
 
     private fun saveCurrentErrorReport(context: Context, reason: String, userNote: String) {
@@ -901,24 +905,26 @@ class AutomationService : AccessibilityService() {
             setPadding(24, 18, 24, 18)
         }
         val title = TextView(this).apply {
-            text = "真人介入：自动化停在这里"
+            text = "悬浮控制窗"
             setTextColor(Color.WHITE)
-            textSize = 16f
+            textSize = 17f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         }
+        val status = TextView(this).apply {
+            setTextColor(Color.rgb(147, 197, 253))
+            textSize = 13f
+        }
+        interventionStatus = status
         val error = TextView(this).apply {
             text = reason
             setTextColor(Color.rgb(255, 220, 160))
             textSize = 14f
         }
         val snapshot = TextView(this).apply {
-            val root = rootInActiveWindow
-            val pkg = root?.packageName?.toString() ?: "拿不到窗口"
-            val txt = root?.let { treeText(it).replace(Regex("\\s+"), " ").trim().take(180) } ?: ""
-            text = "当前应用：$pkg\n页面摘要：$txt"
             setTextColor(Color.LTGRAY)
             textSize = 12f
         }
+        interventionSnapshot = snapshot
         val note = EditText(this).apply {
             hint = "补充错误说明（可选）：比如按钮在右下角、页面弹了登录"
             setTextColor(Color.WHITE)
@@ -940,6 +946,7 @@ class AutomationService : AccessibilityService() {
             }
         }
         panel.addView(title)
+        panel.addView(status)
         panel.addView(error)
         panel.addView(snapshot)
         panel.addView(note)
@@ -949,31 +956,68 @@ class AutomationService : AccessibilityService() {
             btn("继续识别") { resumeAfterIntervention(this) }
         ))
         panel.addView(row(
-            btn("保存报告") {
-                saveCurrentErrorReport(this, reason, note.text?.toString() ?: "")
-                Toast.makeText(this, "错误报告已保存", Toast.LENGTH_SHORT).show()
+            btn("平台：${platformForIntervention()}") {
+                val platforms = listOf("抖音", "快手", "小红书", "哔哩哔哩", "微博")
+                val current = platformForIntervention()
+                overlayPlatform = platforms[(platforms.indexOf(current).coerceAtLeast(0) + 1) % platforms.size]
+                updateInterventionPanel()
+                Toast.makeText(this, "校准平台已切到$overlayPlatform", Toast.LENGTH_SHORT).show()
+            },
+            btn("校准评论点") {
+                removeIntervention()
+                showCalibration(platformForIntervention(), PointStore.KIND_COMMENT)
             },
             btn("校准发送点") {
                 removeIntervention()
                 showCalibration(platformForIntervention(), PointStore.KIND_SEND)
+            }
+        ))
+        panel.addView(row(
+            btn("保存报告") {
+                saveCurrentErrorReport(this, reason, note.text?.toString() ?: "")
+                Toast.makeText(this, "错误报告已保存", Toast.LENGTH_SHORT).show()
             },
             btn("记录点击") {
                 removeIntervention()
                 showRecorder(platformForIntervention())
-            }
+            },
+            btn("刷新状态") { updateInterventionPanel() }
         ))
         panel.addView(row(
             btn("跳过这一条") { skipAfterIntervention(this) },
             btn("停止任务") { stopTask(this) },
-            btn("收起") { showManualBar() }
+            btn("关闭") { removeIntervention() }
         ))
         val scroll = ScrollView(this).apply { addView(panel) }
         try {
             wm.addView(scroll, interventionParams(Gravity.BOTTOM, focusable = true))
             interventionRoot = scroll
+            updateInterventionPanel()
+            schedulePanelRefresh()
         } catch (e: Exception) {
             TaskStore.appendLog(this, "真人介入窗打开失败：${e.message}")
         }
+    }
+
+    private fun updateInterventionPanel() {
+        val platform = platformForIntervention()
+        interventionStatus?.text = "实时状态：$lastStatus\n校准平台：$platform · 评论点 ${PointStore.describe(this, platform, PointStore.KIND_COMMENT)} · 发送点 ${PointStore.describe(this, platform, PointStore.KIND_SEND)}"
+        val root = rootInActiveWindow
+        val pkg = root?.packageName?.toString() ?: "拿不到窗口"
+        val txt = root?.let { treeText(it).replace(Regex("\\s+"), " ").trim().take(180) } ?: ""
+        interventionSnapshot?.text = "当前应用：$pkg\n页面摘要：$txt"
+    }
+
+    private fun schedulePanelRefresh() {
+        if (panelRefreshScheduled) return
+        panelRefreshScheduled = true
+        handler.postDelayed({
+            panelRefreshScheduled = false
+            if (interventionRoot != null) {
+                updateInterventionPanel()
+                schedulePanelRefresh()
+            }
+        }, 1000L)
     }
 
     private fun showManualBar() {
@@ -992,6 +1036,10 @@ class AutomationService : AccessibilityService() {
             textSize = 14f
         }
         bar.addView(label, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        bar.addView(Button(this).apply {
+            text = "控制窗"
+            setOnClickListener { showInterventionPanel(lastFailureReason.ifBlank { "手动打开悬浮控制窗" }) }
+        })
         bar.addView(Button(this).apply {
             text = "继续识别"
             setOnClickListener { resumeAfterIntervention(this@AutomationService) }
@@ -1020,6 +1068,9 @@ class AutomationService : AccessibilityService() {
         val root = interventionRoot ?: return
         interventionRoot = null
         interventionNote = null
+        interventionStatus = null
+        interventionSnapshot = null
+        panelRefreshScheduled = false
         try {
             getSystemService(WindowManager::class.java)?.removeView(root)
         } catch (_: Exception) {
