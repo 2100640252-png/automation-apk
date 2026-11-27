@@ -93,7 +93,7 @@ class AutomationService : AccessibilityService() {
             lastFailureReason = ""
             lastFailureKind = ""
             currentFailureCounted = false
-            instance?.removeIntervention()
+            instance?.showMiniOverlay()
             running = true
             lastStatus = "任务开始：共 ${task.items.size} 条"
             TaskStore.appendLog(context, lastStatus)
@@ -158,7 +158,7 @@ class AutomationService : AccessibilityService() {
                 TaskStore.appendLog(context, "真人介入窗失败：无障碍服务没在运行，请先开启无障碍。")
                 return
             }
-            svc.showInterventionPanel(lastFailureReason.ifBlank { "手动打开真人介入窗：可以手动操作、重新识别、校准点位、记录点击、保存错误报告。" })
+            svc.showInterventionPanel(lastFailureReason.ifBlank { "手动打开悬浮控制窗：可以手动操作、重新识别、校准点位、记录点击、保存错误报告。" }, pauseAutomation = false)
         }
 
         fun runSequenceNow(context: Context, platform: String, comment: String) {
@@ -256,7 +256,7 @@ class AutomationService : AccessibilityService() {
             pausedForHuman = false
             lastFailureReason = ""
             lastFailureKind = ""
-            instance?.removeIntervention()
+            instance?.showMiniOverlay()
             publishRunning = true
             TaskStore.appendLog(context, "发视频步骤5：发布页已打开，开始自动填文案、点发布（$platform）…")
             instance?.schedulePublishStep(context, 3000L)
@@ -275,6 +275,8 @@ class AutomationService : AccessibilityService() {
     private var interventionSnapshot: TextView? = null
     private var panelRefreshScheduled: Boolean = false
     private var overlayPlatform: String = "抖音"
+    private var overlayMode: String = "none"
+    private var panelReason: String = ""
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -287,6 +289,13 @@ class AutomationService : AccessibilityService() {
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) return
+        if (interventionRoot == null) {
+            when (overlayMode) {
+                "panel" -> showInterventionPanel(panelReason.ifBlank { "悬浮控制窗" }, pauseAutomation = pausedForHuman)
+                "mini" -> showMiniOverlay()
+                "manual" -> showManualBar()
+            }
+        }
         if (pausedForHuman) return
         if (publishRunning) {
             schedulePublishStep(this, 1500L)
@@ -842,7 +851,7 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun resumeAfterIntervention(context: Context) {
-        removeIntervention()
+        showMiniOverlay()
         pausedForHuman = false
         attempts = 0
         publishAttempts = 0
@@ -864,7 +873,7 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun skipAfterIntervention(context: Context) {
-        removeIntervention()
+        showMiniOverlay()
         pausedForHuman = false
         if (publishRunning) {
             publishRunning = false
@@ -895,9 +904,10 @@ class AutomationService : AccessibilityService() {
         ).apply { gravity = gravityValue }
     }
 
-    fun showInterventionPanel(reason: String) {
+    fun showInterventionPanel(reason: String, pauseAutomation: Boolean = true) {
         removeIntervention()
-        pausedForHuman = true
+        pausedForHuman = pauseAutomation
+        panelReason = reason
         val wm = getSystemService(WindowManager::class.java) ?: return
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -986,12 +996,13 @@ class AutomationService : AccessibilityService() {
         panel.addView(row(
             btn("跳过这一条") { skipAfterIntervention(this) },
             btn("停止任务") { stopTask(this) },
-            btn("关闭") { removeIntervention() }
+            btn("最小化") { showMiniOverlay() }
         ))
         val scroll = ScrollView(this).apply { addView(panel) }
         try {
             wm.addView(scroll, interventionParams(Gravity.BOTTOM, focusable = true))
             interventionRoot = scroll
+            overlayMode = "panel"
             updateInterventionPanel()
             schedulePanelRefresh()
         } catch (e: Exception) {
@@ -1019,6 +1030,38 @@ class AutomationService : AccessibilityService() {
                 schedulePanelRefresh()
             }
         }, 1000L)
+    }
+
+    fun showMiniOverlay() {
+        removeIntervention()
+        val wm = getSystemService(WindowManager::class.java) ?: return
+        val mini = Button(this).apply {
+            text = "控"
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.argb(235, 15, 23, 42))
+            setOnClickListener { showInterventionPanel(panelReason.ifBlank { "悬浮控制窗" }, pauseAutomation = pausedForHuman) }
+            setOnLongClickListener {
+                overlayMode = "none"
+                removeIntervention()
+                true
+            }
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.END or Gravity.CENTER_VERTICAL }
+        try {
+            wm.addView(mini, params)
+            interventionRoot = mini
+            overlayMode = "mini"
+            TaskStore.appendLog(this, "悬浮窗已最小化：右侧“控”按钮会保留，点它展开控制窗，长按关闭。")
+        } catch (e: Exception) {
+            TaskStore.appendLog(this, "悬浮窗最小化失败：${e.message}")
+        }
     }
 
     private fun showManualBar() {
@@ -1059,6 +1102,7 @@ class AutomationService : AccessibilityService() {
         try {
             wm.addView(bar, interventionParams(Gravity.TOP, focusable = false))
             interventionRoot = bar
+            overlayMode = "manual"
             TaskStore.appendLog(this, "真人接管：自动化已暂停，你可以手动操作；处理完点顶部“继续识别”。")
         } catch (e: Exception) {
             TaskStore.appendLog(this, "真人操作条打开失败：${e.message}")
@@ -1072,6 +1116,7 @@ class AutomationService : AccessibilityService() {
         interventionStatus = null
         interventionSnapshot = null
         panelRefreshScheduled = false
+        overlayMode = "none"
         try {
             getSystemService(WindowManager::class.java)?.removeView(root)
         } catch (_: Exception) {
