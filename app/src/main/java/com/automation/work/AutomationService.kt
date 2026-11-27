@@ -747,13 +747,14 @@ class AutomationService : AccessibilityService() {
         lastFailureReason = ""
         lastFailureKind = ""
         currentFailureCounted = false
-        removeIntervention()
         if (currentIndex >= task.items.size) {
+            removeIntervention()
             running = false
             lastStatus = finishStatus()
             TaskStore.appendLog(context, lastStatus)
             return
         }
+        showMiniOverlay()
         val delayMs = (task.intervalSeconds.coerceAtLeast(1) * 1000L)
         lastStatus = "等 ${task.intervalSeconds} 秒后处理下一条…"
         TaskStore.appendLog(context, lastStatus)
