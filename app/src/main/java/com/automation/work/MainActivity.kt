@@ -243,8 +243,32 @@ class MainActivity : ComponentActivity() {
 
     fun openLinkOnly(link: String) {
         if (link.isBlank()) { taskStatus = "先输入链接。"; return }
-        AutomationService.openLinkOnly(this, link.trim())
-        taskStatus = "正在打开链接…"
+        try {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(link.trim())).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(intent)
+            taskStatus = "已用系统跳转打开链接。"
+            TaskStore.appendLog(this, "链接直开：${link.trim()}")
+        } catch (e: Exception) {
+            taskStatus = "链接打不开：${e.message}"
+            TaskStore.appendLog(this, taskStatus)
+        }
+        refreshLog()
+    }
+
+    fun startScriptOverlay() {
+        if (!Settings.canDrawOverlays(this)) {
+            taskStatus = "先允许悬浮窗权限，允许后回来再点打开悬浮脚本。"
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            return
+        }
+        startService(Intent(this, ScriptOverlayService::class.java))
+        taskStatus = "悬浮脚本已打开：右侧脚本按钮可拖动，点它展开。"
+        refreshLog()
+    }
+
+    fun stopScriptOverlay() {
+        startService(Intent(this, ScriptOverlayService::class.java).setAction(ScriptOverlayService.ACTION_STOP))
+        taskStatus = "悬浮脚本已关闭。"
         refreshLog()
     }
 
@@ -613,256 +637,118 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AutomationApp(activity: MainActivity) {
-    val savedInputs = remember { TaskStore.loadCommentInputs(activity) }
-    val links = remember {
-        mutableStateListOf<String>().apply {
-            addAll(savedInputs.first.filter { it.isNotBlank() })
-            add("")
-        }
-    }
-    var commentText by remember { mutableStateOf(savedInputs.second) }
-    var intervalText by remember { mutableStateOf(savedInputs.third.ifBlank { "10" }) }
-    var caption by remember { mutableStateOf("") }
-    var platform by remember { mutableStateOf("抖音") }
+    var link by remember { mutableStateOf(ScriptStore.loadLink(activity)) }
+    var pasteText by remember { mutableStateOf(ScriptStore.loadText(activity)) }
     var stepsRefresh by remember { mutableStateOf(0) }
-    var repeatText by remember { mutableStateOf(TapSequenceStore.loadRepeat(activity, platform).toString()) }
-    val platforms = listOf("抖音", "快手", "小红书", "视频号", "哔哩哔哩", "TikTok", "YouTube", "微博")
-    val missing = activity.permissionStatus.filter { !it.granted }
-
-    fun persist() {
-        TaskStore.saveCommentInputs(activity, links.toList(), commentText, intervalText)
-    }
-
-    fun normalizeLinks() {
-        val filled = links.filter { it.isNotBlank() }
-        links.clear()
-        links.addAll(filled)
-        links.add("")
-        persist()
-    }
+    val steps = remember(stepsRefresh) { ScriptStore.loadSteps(activity) }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("自动化工作 v${UpdateChecker.currentVersionName(activity)}") },
-                actions = {
-                    TextButton(onClick = { activity.checkUpdate() }) { Text("检查更新") }
-                }
+                title = { Text("悬浮脚本 v${UpdateChecker.currentVersionName(activity)}") },
+                actions = { TextButton(onClick = { activity.checkUpdate() }) { Text("检查更新") } }
             )
         }
     ) { padding ->
         Column(
-            Modifier.padding(padding).padding(16.dp).fillMaxSize()
-                .verticalScroll(rememberScrollState())
+            Modifier.padding(padding).padding(16.dp).fillMaxSize().verticalScroll(rememberScrollState())
         ) {
-            if (missing.isNotEmpty()) {
-                Card(Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(12.dp)) {
-                        Text("还需要这些权限（点一下去开启）：", style = MaterialTheme.typography.titleSmall)
-                        missing.forEach { p ->
-                            Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                                Text("• ${p.name}：未开启")
-                                TextButton(onClick = {
-                                    if (p.key.startsWith("runtime:")) activity.requestPermissions()
-                                    else PermissionHelper.openSettingsFor(activity, p.key)
-                                }) { Text("去开启") }
-                            }
-                        }
-                    }
-                }
-                Spacer(Modifier.height(12.dp))
-            }
-
             Card(
                 Modifier.fillMaxWidth().background(Color(0xFF0F172A), RoundedCornerShape(18.dp)),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A))
             ) {
                 Column(Modifier.padding(18.dp)) {
-                    Text("自动化控制中心", color = Color.White, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                    Text("链接直开 + 悬浮脚本", color = Color.White, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(6.dp))
                     Text("状态：${activity.taskStatus}", color = Color(0xFFCBD5E1))
-                    Text("无障碍：${if (activity.accessibilityOn) "已开启" else "未开启，悬浮窗和自动点击需要先开启"}", color = Color(0xFFFDE68A))
-                    Text("$platform 点位记忆：评论点 ${PointStore.describe(activity, platform, PointStore.KIND_COMMENT)} · 发送点 ${PointStore.describe(activity, platform, PointStore.KIND_SEND)}", color = Color(0xFF93C5FD))
+                    Text("输入层：${InputEngine.backendName()}", color = Color(0xFF93C5FD))
+                    Text("已记点位：${steps.size} 个", color = Color(0xFFFDE68A))
                     Spacer(Modifier.height(12.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { activity.showIntervention() }, modifier = Modifier.weight(1f)) { Text("打开悬浮控制窗") }
-                        Button(onClick = { activity.startCommentTask(links.toList(), commentText, intervalText.toIntOrNull() ?: 10) }, modifier = Modifier.weight(1f)) { Text("开始评论") }
-                        OutlinedButton(onClick = { activity.stopCommentTask() }, modifier = Modifier.weight(1f)) { Text("停止") }
+                        Button(onClick = { activity.startScriptOverlay() }, modifier = Modifier.weight(1f)) { Text("打开悬浮脚本") }
+                        OutlinedButton(onClick = { activity.stopScriptOverlay() }, modifier = Modifier.weight(1f)) { Text("关闭悬浮") }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = { ShizukuHelper.requestPermission() }, modifier = Modifier.weight(1f)) { Text("申请 Shizuku 授权") }
+                        OutlinedButton(onClick = { activity.openShizukuApp() }, modifier = Modifier.weight(1f)) { Text("打开 Shizuku") }
                     }
                 }
             }
-            Spacer(Modifier.height(16.dp))
 
-            Text("链接：填完一个，下一个自动出现；下一个不填就截止", style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(8.dp))
-            links.forEachIndexed { index, value ->
-                OutlinedTextField(
-                    value = value,
-                    onValueChange = {
-                        links[index] = it
-                        normalizeLinks()
-                    },
-                    label = { Text(if (value.isBlank()) "第 ${index + 1} 条链接（不填就截止）" else "第 ${index + 1} 条链接") },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(8.dp))
-            }
-            OutlinedTextField(
-                value = commentText,
-                onValueChange = { commentText = it; persist() },
-                label = { Text("评论内容") },
-                modifier = Modifier.fillMaxWidth().height(90.dp)
-            )
+            Spacer(Modifier.height(16.dp))
+            Text("链接直开", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
             OutlinedTextField(
-                value = intervalText,
-                onValueChange = { intervalText = it; persist() },
-                label = { Text("每条间隔秒数") },
+                value = link,
+                onValueChange = { link = it; ScriptStore.saveLink(activity, it) },
+                label = { Text("粘贴链接") },
                 modifier = Modifier.fillMaxWidth()
             )
             Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(
-                    onClick = { activity.openLinkOnly(links.firstOrNull { it.isNotBlank() } ?: "") },
-                    modifier = Modifier.weight(1f)
-                ) { Text("打开第一条") }
-                Button(
-                    onClick = { activity.startCommentTask(links.toList(), commentText, intervalText.toIntOrNull() ?: 10) },
-                    modifier = Modifier.weight(1f)
-                ) { Text("开始评论") }
-                OutlinedButton(onClick = { activity.stopCommentTask() }, modifier = Modifier.weight(1f)) { Text("停止") }
-            }
-            Spacer(Modifier.height(6.dp))
-            Text("开始后按顺序逐条处理：自动打开、自动识别、填评论、点发送、验证结果。哪一步失败，就弹出真人介入窗并保存错误报告。")
+            Button(onClick = { activity.openLinkOnly(link) }, modifier = Modifier.fillMaxWidth()) { Text("直接打开链接") }
 
             Spacer(Modifier.height(16.dp))
-            Text("真人设定：失败时可手动校准和记录", style = MaterialTheme.typography.titleMedium)
+            Text("脚本点位", style = MaterialTheme.typography.titleMedium)
+            Text("打开悬浮脚本后点“捕捉点位”，在目标页面点一下或滑动一下，脚本会记住并回显到这里。")
             Spacer(Modifier.height(8.dp))
-            Text("正常评论走自动识别状态机，不再盲目回放。这里是真人介入时的设定工具：自动识别不到时，可以记录点击位置或校准点位，再让软件重新识别。")
-            Spacer(Modifier.height(8.dp))
-            platforms.chunked(4).forEach { row ->
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    row.forEach { p ->
-                        if (p == platform) {
-                            Button(onClick = { platform = p; repeatText = TapSequenceStore.loadRepeat(activity, p).toString() }) { Text(p) }
-                        } else {
-                            OutlinedButton(onClick = { platform = p; repeatText = TapSequenceStore.loadRepeat(activity, p).toString() }) { Text(p) }
-                        }
-                    }
-                }
-                Spacer(Modifier.height(4.dp))
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { activity.startRecorder(platform) }, modifier = Modifier.weight(1f)) { Text("开始记录点击") }
-                OutlinedButton(onClick = { activity.runSequence(platform, commentText) }, modifier = Modifier.weight(1f)) { Text("执行点击序列") }
-            }
-            Spacer(Modifier.height(8.dp))
-            key(stepsRefresh, platform) {
-                val steps = TapSequenceStore.loadSteps(activity, platform)
-                if (steps.isEmpty()) {
-                    Text("$platform 还没有记录点击。")
-                } else {
-                    steps.forEachIndexed { i, s ->
-                        Card(Modifier.fillMaxWidth().padding(bottom = 6.dp)) {
-                            Row(
-                                Modifier.fillMaxWidth().padding(10.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(
-                                    if (s.type == TapSequenceStore.TYPE_FILL) "第 ${i + 1} 步：填入评论"
-                                    else "第 ${i + 1} 步：点击 X ${(s.x * 100).toInt()}% · Y ${(s.y * 100).toInt()}% · ${s.count} 次"
+            if (steps.isEmpty()) {
+                Text("还没有点位。")
+            } else {
+                steps.forEachIndexed { i, s ->
+                    var name by remember(i, stepsRefresh) { mutableStateOf(s.name) }
+                    Card(Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                        Column(Modifier.padding(12.dp)) {
+                            Text("第 ${i + 1} 步：${s.type} · X ${(s.x * 100).toInt()}% Y ${(s.y * 100).toInt()}%")
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedTextField(
+                                    value = name,
+                                    onValueChange = { name = it },
+                                    label = { Text("命名") },
+                                    modifier = Modifier.weight(1f)
                                 )
-                                Row {
-                                    if (s.type == TapSequenceStore.TYPE_TAP) {
-                                        TextButton(onClick = {
-                                            val list = steps.toMutableList()
-                                            list[i] = s.copy(count = (s.count - 1).coerceAtLeast(1))
-                                            TapSequenceStore.saveSteps(activity, platform, list)
-                                            stepsRefresh++
-                                        }) { Text("次数-") }
-                                        TextButton(onClick = {
-                                            val list = steps.toMutableList()
-                                            list[i] = s.copy(count = s.count + 1)
-                                            TapSequenceStore.saveSteps(activity, platform, list)
-                                            stepsRefresh++
-                                        }) { Text("次数+") }
-                                    }
-                                    TextButton(onClick = {
-                                        val list = steps.toMutableList()
-                                        list.removeAt(i)
-                                        TapSequenceStore.saveSteps(activity, platform, list)
-                                        stepsRefresh++
-                                    }) { Text("删除") }
-                                }
+                                Button(onClick = {
+                                    val list = steps.toMutableList(); list[i] = s.copy(name = name.ifBlank { s.name })
+                                    ScriptStore.saveSteps(activity, list); stepsRefresh++
+                                }) { Text("保存名") }
+                                TextButton(onClick = {
+                                    val list = steps.toMutableList(); list.removeAt(i)
+                                    ScriptStore.saveSteps(activity, list); stepsRefresh++
+                                }) { Text("删除") }
                             }
                         }
                     }
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = {
-                        val list = steps.toMutableList()
-                        list.add(TapSequenceStore.Step(TapSequenceStore.TYPE_FILL, 0f, 0f, 1))
-                        TapSequenceStore.saveSteps(activity, platform, list)
-                        stepsRefresh++
-                    }) { Text("加一步：填入评论") }
-                    OutlinedButton(onClick = { stepsRefresh++ }) { Text("刷新序列") }
-                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = {
+                    ScriptStore.addStep(activity, ScriptStore.Step(ScriptStore.TYPE_WAIT, "等待${steps.size + 1}", durationMs = 1000)); stepsRefresh++
+                }, modifier = Modifier.weight(1f)) { Text("加等待") }
+                OutlinedButton(onClick = {
+                    ScriptStore.addStep(activity, ScriptStore.Step(ScriptStore.TYPE_PASTE, "粘贴${steps.size + 1}", text = pasteText)); stepsRefresh++
+                }, modifier = Modifier.weight(1f)) { Text("加粘贴") }
+                OutlinedButton(onClick = { stepsRefresh++ }, modifier = Modifier.weight(1f)) { Text("刷新点位") }
             }
             Spacer(Modifier.height(8.dp))
             OutlinedTextField(
-                value = repeatText,
-                onValueChange = {
-                    repeatText = it
-                    TapSequenceStore.saveRepeat(activity, platform, it.toIntOrNull() ?: 1)
-                },
-                label = { Text("整套序列重复遍数") },
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            Spacer(Modifier.height(16.dp))
-            Text("发视频", style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(8.dp))
-            Button(onClick = { activity.pickVideo() }, modifier = Modifier.fillMaxWidth()) { Text("选择视频") }
-            if (activity.videos.isEmpty()) {
-                Text("还没选视频。")
-            } else {
-                Text("已选：${activity.videos.first().name}")
-            }
-            Spacer(Modifier.height(8.dp))
-            OutlinedTextField(
-                value = caption,
-                onValueChange = { caption = it },
-                label = { Text("视频文案") },
+                value = pasteText,
+                onValueChange = { pasteText = it; ScriptStore.saveText(activity, it) },
+                label = { Text("粘贴步骤用的文字") },
                 modifier = Modifier.fillMaxWidth().height(80.dp)
             )
-            Spacer(Modifier.height(8.dp))
-            Button(onClick = { activity.publishVideoSimple(platform, caption) }, modifier = Modifier.fillMaxWidth()) {
-                Text("发视频到$platform（自动发布）")
-            }
-            Text("发布页打开后，软件会自动填文案、点发布并验证；失败会弹出真人介入窗并保存错误报告。")
 
             Spacer(Modifier.height(16.dp))
-            Text(activity.taskStatus)
+            Text("运行日志", style = MaterialTheme.typography.titleSmall)
+            Text(activity.logText, modifier = Modifier.fillMaxWidth().height(180.dp).verticalScroll(rememberScrollState()))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { activity.refreshLog() }, modifier = Modifier.weight(1f)) { Text("刷新日志") }
+                TextButton(onClick = { TaskStore.clearLog(activity); activity.refreshLog() }, modifier = Modifier.weight(1f)) { Text("清空日志") }
+            }
             if (activity.updateInfo != null) {
                 Spacer(Modifier.height(8.dp))
                 Text("发现新版：${activity.updateInfo!!.tag}")
                 Button(onClick = { activity.downloadUpdate() }, modifier = Modifier.fillMaxWidth()) { Text("下载并安装新版") }
             }
-            Spacer(Modifier.height(8.dp))
-            Text("错误报告：", style = MaterialTheme.typography.titleSmall)
-            Text(activity.errorReportText, modifier = Modifier.fillMaxWidth().height(150.dp).verticalScroll(rememberScrollState()))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { activity.showIntervention() }, modifier = Modifier.weight(1f)) { Text("打开悬浮控制窗") }
-                OutlinedButton(onClick = { activity.copyErrorReport() }, modifier = Modifier.weight(1f)) { Text("复制错误报告") }
-                TextButton(onClick = { activity.clearErrorReports() }, modifier = Modifier.weight(1f)) { Text("清空报告") }
-            }
-            Spacer(Modifier.height(8.dp))
-            Text("运行日志：", style = MaterialTheme.typography.titleSmall)
-            Text(activity.logText, modifier = Modifier.fillMaxWidth().height(160.dp).verticalScroll(rememberScrollState()))
-            TextButton(onClick = {
-                TaskStore.clearLog(activity)
-                activity.refreshLog()
-            }) { Text("清空日志") }
         }
     }
 }
