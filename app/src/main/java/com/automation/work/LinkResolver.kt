@@ -213,7 +213,7 @@ object LinkResolver {
         }
         return try {
             context.startActivity(intent)
-            val actual = resolved.activityInfo?.let { "${it.packageName}/${it.name}" } ?: targetPackage
+            val actual = resolved.flattenToString()
             val reason = "步骤3 直达成功：VIEW intent 已发出，方式=$method，目标包名=$targetPackage，实际接管=$actual，目标URI=$uri"
             TaskStore.appendLog(context, reason)
             OpenResult(true, platform, targetPackage, method, reason)
