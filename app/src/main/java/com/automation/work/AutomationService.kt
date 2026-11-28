@@ -894,7 +894,7 @@ class AutomationService : AccessibilityService() {
 
     private fun verifiedSearchResults(root: AccessibilityNodeInfo, info: PlatformRegistry.PlatformInfo): Boolean {
         val snapshot = captureWindowSnapshot(searchTopic, "")
-        if (snapshot.pkg != info.packageName) return false
+        if (snapshot.packageName != info.packageName) return false
         val cards = extractResearchCards(root)
         if (cards.isNotEmpty()) return true
         val text = treeText(root)
