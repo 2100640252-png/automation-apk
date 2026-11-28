@@ -55,6 +55,7 @@ class MainActivity : ComponentActivity() {
     var targetX by mutableStateOf(0)
     var targetY by mutableStateOf(0)
     var pointRefresh by mutableStateOf(0)
+    var researchRefresh by mutableStateOf(0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -70,9 +71,9 @@ class MainActivity : ComponentActivity() {
 
     fun currentVersionName(): String {
         return try {
-            packageManager.getPackageInfo(packageName, 0).versionName ?: "4.4.0"
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "4.5.0"
         } catch (_: Exception) {
-            "4.4.0"
+            "4.5.0"
         }
     }
 
@@ -176,6 +177,143 @@ class MainActivity : ComponentActivity() {
         }
         AutomationService.startSearchAssist(this, platform, topic, quantity)
         taskStatus = "搜索辅助已开始：打开 $platform 搜索“${topic.trim()}”，停在结果页；数量只作候选确认上限，不自动评论。"
+        refreshState()
+    }
+
+    fun unsupportedResearchMessage(step: String, platform: String): String {
+        val info = PlatformRegistry.find(platform)
+        return if (info == null) {
+            "失败类别：SEARCH_UNSUPPORTED_PLATFORM_MODE\n步骤：$step\n平台：$platform\n期望包名：未内置\n实际前台包名：未知\n原因：未内置平台：$platform\n下一步：请选择内置平台后重试；已停止，不回退其他平台或浏览器。"
+        } else {
+            "失败类别：SEARCH_UNSUPPORTED_PLATFORM_MODE\n步骤：$step\n平台：${info.label}\n期望包名：${info.packageName}\n实际前台包名：未知\n原因：${info.unsupportedReason}\n下一步：请选择支持的平台后重试；已停止，不回退其他平台或浏览器。"
+        }
+    }
+
+    fun startResearchSearch(inputs: TaskStore.ResearchInputs) {
+        if (inputs.topic.isBlank()) {
+            taskStatus = "话题找素材失败：先填写话题。"
+            refreshState()
+            return
+        }
+        val info = PlatformRegistry.find(inputs.platform)
+        if (info == null) {
+            taskStatus = unsupportedResearchMessage("打开搜索", inputs.platform)
+            TaskStore.appendLog(this, taskStatus)
+            refreshState()
+            return
+        }
+        if (!info.supported) {
+            taskStatus = unsupportedResearchMessage("打开搜索", inputs.platform)
+            TaskStore.appendLog(this, taskStatus)
+            refreshState()
+            return
+        }
+        val gate = AutomationService.gateFailureReason()
+        if (gate != null) {
+            taskStatus = gate
+            TaskStore.appendLog(this, gate)
+            refreshState()
+            return
+        }
+        AutomationService.startResearchSearch(this, inputs.copy(platform = info.label))
+        taskStatus = "话题找素材已开始：打开 ${info.label}（${info.packageName}）搜索“${inputs.topic.trim()}”，停在结果页后手动滑动并采集当前可见。"
+        refreshState()
+    }
+
+    fun collectResearch(inputs: TaskStore.ResearchInputs) {
+        if (inputs.topic.isBlank()) {
+            taskStatus = "话题找素材失败：先填写话题。"
+            refreshState()
+            return
+        }
+        val info = PlatformRegistry.find(inputs.platform)
+        if (info == null || !info.supported) {
+            taskStatus = unsupportedResearchMessage("采集当前可见", inputs.platform)
+            TaskStore.appendLog(this, taskStatus)
+            refreshState()
+            return
+        }
+        if (AutomationService.instance == null) {
+            taskStatus = AutomationService.gateFailureReason() ?: "无障碍服务未连接。"
+            PermissionHelper.openAccessibilitySettings(this)
+            refreshState()
+            return
+        }
+        AutomationService.collectVisibleResearch(this, inputs.copy(platform = info.label))
+        taskStatus = AutomationService.lastStatus
+        researchRefresh++
+        refreshState()
+    }
+
+    fun recordResearchLink(inputs: TaskStore.ResearchInputs) {
+        if (inputs.topic.isBlank()) {
+            taskStatus = "记录当前链接失败：先填写话题。"
+            refreshState()
+            return
+        }
+        val info = PlatformRegistry.find(inputs.platform)
+        if (info == null || !info.supported) {
+            taskStatus = unsupportedResearchMessage("记录当前链接", inputs.platform)
+            TaskStore.appendLog(this, taskStatus)
+            refreshState()
+            return
+        }
+        if (AutomationService.instance == null) {
+            taskStatus = AutomationService.gateFailureReason() ?: "无障碍服务未连接。"
+            PermissionHelper.openAccessibilitySettings(this)
+            refreshState()
+            return
+        }
+        AutomationService.recordCurrentResearchLink(this, inputs.copy(platform = info.label))
+        taskStatus = AutomationService.lastStatus
+        researchRefresh++
+        refreshState()
+    }
+
+    fun collectPublicResearch(inputs: TaskStore.ResearchInputs) {
+        if (inputs.topic.isBlank()) {
+            taskStatus = "公开网页采集失败：先填写话题。"
+            refreshState()
+            return
+        }
+        val info = PlatformRegistry.find(inputs.platform)
+        if (info == null || !info.supported) {
+            taskStatus = unsupportedResearchMessage("公开网页采集", inputs.platform)
+            TaskStore.appendLog(this, taskStatus)
+            refreshState()
+            return
+        }
+        if (!info.publicWebSupported) {
+            taskStatus = "失败类别：SEARCH_UNSUPPORTED_PLATFORM_MODE\n步骤：公开网页采集\n平台：${info.label}\n期望包名：${info.packageName}\n实际前台包名：未知\n原因：${info.publicWebReason}\n下一步：请使用 App内搜索，并确保 ${info.packageName} 已安装登录。"
+            TaskStore.appendLog(this, taskStatus)
+            refreshState()
+            return
+        }
+        if (AutomationService.instance == null) {
+            taskStatus = AutomationService.gateFailureReason() ?: "无障碍服务未连接。"
+            PermissionHelper.openAccessibilitySettings(this)
+            refreshState()
+            return
+        }
+        AutomationService.collectPublicResearch(this, inputs.copy(platform = info.label, collectionMode = "公开网页"))
+        taskStatus = AutomationService.lastStatus
+        researchRefresh++
+        refreshState()
+    }
+
+    fun copyResearchList() {
+        val text = TaskStore.researchExportText(this)
+        val clipboard = getSystemService(ClipboardManager::class.java)
+        clipboard?.setPrimaryClip(ClipData.newPlainText("话题找素材链接清单", text))
+        taskStatus = "链接清单已复制：共 ${TaskStore.loadResearchItems(this).size} 条；没有真实链接的条目会显示待补链接。"
+        TaskStore.appendLog(this, taskStatus)
+        refreshState()
+    }
+
+    fun clearResearchList() {
+        TaskStore.clearResearchItems(this)
+        taskStatus = "素材清单已清空。"
+        researchRefresh++
         refreshState()
     }
 
@@ -367,6 +505,7 @@ fun AutomationApp(activity: MainActivity) {
     val savedComment = remember { TaskStore.loadCommentInputs(activity) }
     val savedVideo = remember { TaskStore.loadVideoInputs(activity) }
     val savedSearch = remember { TaskStore.loadSearchInputs(activity) }
+    val savedResearch = remember { TaskStore.loadResearchInputs(activity) }
     var selectedTab by remember { mutableStateOf(0) }
     var commentLink by remember { mutableStateOf(savedComment.first.firstOrNull() ?: "") }
     var commentText by remember { mutableStateOf(savedComment.second) }
@@ -374,11 +513,20 @@ fun AutomationApp(activity: MainActivity) {
     var videoCaption by remember { mutableStateOf(savedVideo.caption) }
     var videoMaterial by remember { mutableStateOf(savedVideo.material) }
     var videoSchedule by remember { mutableStateOf(savedVideo.schedule) }
-    var platform by remember { mutableStateOf(savedSearch.platform) }
+    var platform by remember { mutableStateOf(PlatformRegistry.canonicalLabel(savedSearch.platform)) }
     var searchTopic by remember { mutableStateOf(savedSearch.topic) }
     var searchQuantity by remember { mutableStateOf(savedSearch.quantity.toString()) }
-    val tabs = listOf("评论", "视频", "点位", "日志")
-    val platforms = listOf("抖音", "快手", "小红书", "哔哩哔哩", "微博")
+    var researchPlatform by remember { mutableStateOf(PlatformRegistry.canonicalLabel(savedResearch.platform)) }
+    var researchTopic by remember { mutableStateOf(savedResearch.topic) }
+    var researchContentType by remember { mutableStateOf(savedResearch.contentType) }
+    var researchSort by remember { mutableStateOf(savedResearch.sortPreference) }
+    var researchLimit by remember { mutableStateOf(savedResearch.limit.toString()) }
+    var researchMode by remember { mutableStateOf(savedResearch.collectionMode) }
+    val tabs = listOf("评论", "视频", "素材", "点位", "日志")
+    val platforms = PlatformRegistry.labels
+    val researchItems = remember(activity.researchRefresh, activity.logText, researchSort) {
+        TaskStore.sortResearchItems(TaskStore.loadResearchItems(activity), researchSort)
+    }
     val gatePassed = activity.gateReason.startsWith("已通过")
     val semanticPoints = remember(platform, activity.pointRefresh, activity.logText) {
         PointStore.listSemantic(activity, platform).associateBy { it.role }
@@ -395,6 +543,21 @@ fun AutomationApp(activity: MainActivity) {
     fun saveSearch(platform: String, topic: String, quantityText: String) {
         val quantity = quantityText.toIntOrNull()?.coerceIn(1, 100) ?: 10
         TaskStore.saveSearchInputs(activity, TaskStore.SearchInputs(platform, topic, quantity))
+    }
+
+    fun currentResearchInputs(): TaskStore.ResearchInputs {
+        return TaskStore.ResearchInputs(
+            platform = researchPlatform,
+            topic = researchTopic,
+            contentType = researchContentType,
+            sortPreference = researchSort,
+            limit = researchLimit.toIntOrNull()?.coerceIn(1, 100) ?: 20,
+            collectionMode = researchMode
+        )
+    }
+
+    fun saveResearch() {
+        TaskStore.saveResearchInputs(activity, currentResearchInputs())
     }
 
     Scaffold(
@@ -623,6 +786,138 @@ fun AutomationApp(activity: MainActivity) {
                     }
                 }
                 2 -> {
+                    val researchInfo = PlatformRegistry.find(researchPlatform)
+                    Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A))) {
+                        Column(Modifier.padding(18.dp)) {
+                            Text("话题找素材", color = Color.White, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(8.dp))
+                            GateChips(activity)
+                            Spacer(Modifier.height(8.dp))
+                            Text("按话题找高流量、新发视频/图文，只采集链接清单供学习；不从清单自动评论。", color = Color(0xFFCBD5E1))
+                            Text(PlatformRegistry.routeSummary(researchPlatform), color = Color(0xFF93C5FD))
+                            Text("App内搜索需要所选 App 已安装并登录；未安装会按包名失败。公开网页只采集公开可见结果，可能不完整，不用于评论证明。", color = Color(0xFFFDE68A))
+                            if (researchInfo != null && !researchInfo.supported) {
+                                Text("该平台不支持：${researchInfo.unsupportedReason}", color = Color(0xFFFCA5A5))
+                            }
+                            if (researchMode == "公开网页" && researchInfo != null && !researchInfo.publicWebSupported) {
+                                Text("公开网页模式不支持：${researchInfo.publicWebReason}", color = Color(0xFFFCA5A5))
+                            }
+                            Text("状态：${activity.taskStatus}", color = Color(0xFFCBD5E1))
+                        }
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(16.dp)) {
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    onClick = {
+                                        val next = (platforms.indexOf(researchPlatform).coerceAtLeast(0) + 1) % platforms.size
+                                        researchPlatform = platforms[next]
+                                        saveResearch()
+                                    },
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("平台：$researchPlatform") }
+                                OutlinedButton(
+                                    onClick = {
+                                        researchMode = if (researchMode == "公开网页") "App内搜索" else "公开网页"
+                                        saveResearch()
+                                    },
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("方式：$researchMode") }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    onClick = {
+                                        val types = listOf("全部", "视频", "图文")
+                                        researchContentType = types[(types.indexOf(researchContentType).coerceAtLeast(0) + 1) % types.size]
+                                        saveResearch()
+                                    },
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("类型：$researchContentType") }
+                                OutlinedButton(
+                                    onClick = {
+                                        val sorts = listOf("综合", "高流量优先", "新发优先")
+                                        researchSort = sorts[(sorts.indexOf(researchSort).coerceAtLeast(0) + 1) % sorts.size]
+                                        saveResearch()
+                                    },
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("排序：$researchSort") }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            OutlinedTextField(
+                                value = researchTopic,
+                                onValueChange = {
+                                    researchTopic = it
+                                    saveResearch()
+                                },
+                                label = { Text("话题") },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            OutlinedTextField(
+                                value = researchLimit,
+                                onValueChange = {
+                                    researchLimit = it.filter { ch -> ch.isDigit() }.take(3)
+                                    saveResearch()
+                                },
+                                label = { Text("采集上限") },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(Modifier.height(10.dp))
+                            Button(
+                                onClick = {
+                                    if (researchMode == "公开网页") activity.collectPublicResearch(currentResearchInputs()) else activity.startResearchSearch(currentResearchInputs())
+                                },
+                                enabled = researchTopic.isNotBlank() && (researchMode == "公开网页" || gatePassed),
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text("打开搜索") }
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    onClick = { activity.collectResearch(currentResearchInputs()) },
+                                    enabled = researchTopic.isNotBlank(),
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("采集当前可见") }
+                                OutlinedButton(
+                                    onClick = { activity.recordResearchLink(currentResearchInputs()) },
+                                    enabled = researchTopic.isNotBlank(),
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("记录当前链接") }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(onClick = { activity.copyResearchList() }, modifier = Modifier.weight(1f)) { Text("复制清单") }
+                                OutlinedButton(onClick = { activity.clearResearchList() }, modifier = Modifier.weight(1f)) { Text("清空清单") }
+                                OutlinedButton(onClick = { activity.researchRefresh++; activity.refreshState() }, modifier = Modifier.weight(1f)) { Text("刷新清单") }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            Text("已采集 ${researchItems.size} 条 · 已去重 ${TaskStore.researchLastDedupedCount(activity)} 条 · 链接清单按${researchSort}排序。没有暴露链接/ID 的条目会显示待补链接，不编造 URL。")
+                        }
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    if (researchItems.isEmpty()) {
+                        Card(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(16.dp)) {
+                                Text("链接清单为空：先打开搜索，停在结果页后手动滑动，再点“采集当前可见”。")
+                            }
+                        }
+                    } else {
+                        researchItems.forEachIndexed { index, item ->
+                            Card(Modifier.fillMaxWidth()) {
+                                Column(Modifier.padding(14.dp)) {
+                                    Text("${index + 1}. ${item.title.ifBlank { "未识别标题" }}", fontWeight = FontWeight.Bold)
+                                    Text("${item.scoreReason} · ${item.contentType} · ${item.author.ifBlank { "未知作者" }}")
+                                    Text("${item.metricsText.ifBlank { "未识别流量" }} · ${item.timeText.ifBlank { "未识别时间" }}")
+                                    Text(item.link.ifBlank { "待补链接" })
+                                    Text("状态：${item.status}")
+                                }
+                            }
+                            Spacer(Modifier.height(10.dp))
+                        }
+                    }
+                }
+                3 -> {
                     Card(Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(16.dp)) {
                             Text("语义点位", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)

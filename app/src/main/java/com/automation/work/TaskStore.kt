@@ -19,6 +19,9 @@ object TaskStore {
     private const val KEY_VIDEO_INPUTS = "video_inputs_json"
     private const val KEY_SEARCH_INPUTS = "search_inputs_json"
     private const val KEY_COMMENTED_TARGETS = "commented_target_keys_json"
+    private const val KEY_RESEARCH_INPUTS = "research_inputs_json"
+    private const val KEY_RESEARCH_ITEMS = "research_items_json"
+    private const val KEY_RESEARCH_LAST_DEDUPED = "research_last_deduped"
 
     data class SearchInputs(
         val platform: String = "抖音",
@@ -31,6 +34,39 @@ object TaskStore {
         val caption: String = "",
         val material: String = "",
         val schedule: String = ""
+    )
+
+    data class ResearchInputs(
+        val platform: String = "抖音",
+        val topic: String = "",
+        val contentType: String = "全部",
+        val sortPreference: String = "综合",
+        val limit: Int = 20,
+        val collectionMode: String = "App内搜索"
+    )
+
+    data class ResearchItem(
+        val platform: String,
+        val topic: String,
+        val title: String,
+        val author: String,
+        val metricsText: String,
+        val metricScore: Long,
+        val timeText: String,
+        val newnessScore: Int,
+        val score: Double,
+        val scoreReason: String,
+        val contentType: String,
+        val link: String,
+        val status: String,
+        val dedupeKey: String,
+        val capturedAt: Long
+    )
+
+    data class ResearchMergeResult(
+        val items: List<ResearchItem>,
+        val added: Int,
+        val deduped: Int
     )
 
     /** 运行日志：最多保留 200 行，新日志在前。 */
@@ -199,6 +235,187 @@ object TaskStore {
     }
 
     fun commentedTargetCount(context: Context): Int = commentedTargetKeys(context).size
+
+    fun saveResearchInputs(context: Context, inputs: ResearchInputs) {
+        val o = JSONObject()
+        o.put("platform", inputs.platform)
+        o.put("topic", inputs.topic)
+        o.put("contentType", inputs.contentType)
+        o.put("sortPreference", inputs.sortPreference)
+        o.put("limit", inputs.limit.coerceIn(1, 100))
+        o.put("collectionMode", inputs.collectionMode)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_RESEARCH_INPUTS, o.toString()).apply()
+    }
+
+    fun loadResearchInputs(context: Context): ResearchInputs {
+        val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_RESEARCH_INPUTS, null) ?: return ResearchInputs()
+        return try {
+            val o = JSONObject(raw)
+            ResearchInputs(
+                platform = o.optString("platform", "抖音"),
+                topic = o.optString("topic", ""),
+                contentType = o.optString("contentType", "全部"),
+                sortPreference = o.optString("sortPreference", "综合"),
+                limit = o.optInt("limit", 20).coerceIn(1, 100),
+                collectionMode = o.optString("collectionMode", "App内搜索")
+            )
+        } catch (_: Exception) {
+            ResearchInputs()
+        }
+    }
+
+    private fun researchItemToJson(item: ResearchItem): JSONObject {
+        val o = JSONObject()
+        o.put("platform", item.platform)
+        o.put("topic", item.topic)
+        o.put("title", item.title)
+        o.put("author", item.author)
+        o.put("metricsText", item.metricsText)
+        o.put("metricScore", item.metricScore)
+        o.put("timeText", item.timeText)
+        o.put("newnessScore", item.newnessScore)
+        o.put("score", item.score)
+        o.put("scoreReason", item.scoreReason)
+        o.put("contentType", item.contentType)
+        o.put("link", item.link)
+        o.put("status", item.status)
+        o.put("dedupeKey", item.dedupeKey)
+        o.put("capturedAt", item.capturedAt)
+        return o
+    }
+
+    private fun researchItemFromJson(o: JSONObject): ResearchItem {
+        return ResearchItem(
+            platform = o.optString("platform", ""),
+            topic = o.optString("topic", ""),
+            title = o.optString("title", ""),
+            author = o.optString("author", ""),
+            metricsText = o.optString("metricsText", ""),
+            metricScore = o.optLong("metricScore", 0L),
+            timeText = o.optString("timeText", ""),
+            newnessScore = o.optInt("newnessScore", 0),
+            score = o.optDouble("score", 0.0),
+            scoreReason = o.optString("scoreReason", ""),
+            contentType = o.optString("contentType", "全部"),
+            link = o.optString("link", ""),
+            status = o.optString("status", "待补链接"),
+            dedupeKey = o.optString("dedupeKey", ""),
+            capturedAt = o.optLong("capturedAt", 0L)
+        )
+    }
+
+    fun sortResearchItems(items: List<ResearchItem>, sortPreference: String): List<ResearchItem> {
+        return when (sortPreference) {
+            "高流量优先" -> items.sortedWith(compareByDescending<ResearchItem> { it.metricScore }.thenByDescending { it.score }.thenByDescending { it.newnessScore })
+            "新发优先" -> items.sortedWith(compareByDescending<ResearchItem> { it.newnessScore }.thenByDescending { it.score }.thenByDescending { it.metricScore })
+            else -> items.sortedWith(compareByDescending<ResearchItem> { it.score }.thenByDescending { it.metricScore }.thenByDescending { it.newnessScore })
+        }
+    }
+
+    fun loadResearchItems(context: Context): List<ResearchItem> {
+        val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_RESEARCH_ITEMS, null) ?: return emptyList()
+        return try {
+            val arr = JSONArray(raw)
+            val out = mutableListOf<ResearchItem>()
+            for (i in 0 until arr.length()) {
+                arr.optJSONObject(i)?.let { out.add(researchItemFromJson(it)) }
+            }
+            out
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    fun saveResearchItems(context: Context, items: List<ResearchItem>, sortPreference: String, limit: Int) {
+        val sorted = sortResearchItems(items, sortPreference).take(limit.coerceIn(1, 100))
+        val arr = JSONArray()
+        sorted.forEach { arr.put(researchItemToJson(it)) }
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_RESEARCH_ITEMS, arr.toString()).apply()
+    }
+
+    fun addResearchItems(context: Context, incoming: List<ResearchItem>, inputs: ResearchInputs): ResearchMergeResult {
+        val existing = loadResearchItems(context).toMutableList()
+        val keys = existing.map { it.dedupeKey }.toMutableSet()
+        val links = existing.map { it.link }.filter { it.isNotBlank() }.toMutableSet()
+        var added = 0
+        var deduped = 0
+        for (item in incoming) {
+            val linkKey = item.link.trim()
+            if (item.dedupeKey.isNotBlank() && item.dedupeKey in keys || linkKey.isNotBlank() && linkKey in links) {
+                deduped++
+                continue
+            }
+            existing.add(item)
+            if (item.dedupeKey.isNotBlank()) keys.add(item.dedupeKey)
+            if (linkKey.isNotBlank()) links.add(linkKey)
+            added++
+        }
+        val sorted = sortResearchItems(existing, inputs.sortPreference).take(inputs.limit.coerceIn(1, 100))
+        saveResearchItems(context, sorted, inputs.sortPreference, inputs.limit)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putInt(KEY_RESEARCH_LAST_DEDUPED, deduped).apply()
+        return ResearchMergeResult(sorted, added, deduped)
+    }
+
+    fun upsertResearchItem(context: Context, item: ResearchItem, inputs: ResearchInputs): ResearchMergeResult {
+        val existing = loadResearchItems(context).toMutableList()
+        val index = existing.indexOfFirst {
+            (item.dedupeKey.isNotBlank() && it.dedupeKey == item.dedupeKey) ||
+                (item.link.isNotBlank() && it.link == item.link) ||
+                (it.platform == item.platform && it.title == item.title && it.author == item.author && item.title.isNotBlank())
+        }
+        var added = 0
+        var deduped = 0
+        if (index >= 0) {
+            val old = existing[index]
+            existing[index] = if (item.link.isNotBlank()) item else old.copy(status = old.status.ifBlank { item.status })
+            deduped = 1
+        } else {
+            existing.add(item)
+            added = 1
+        }
+        val sorted = sortResearchItems(existing, inputs.sortPreference).take(inputs.limit.coerceIn(1, 100))
+        saveResearchItems(context, sorted, inputs.sortPreference, inputs.limit)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putInt(KEY_RESEARCH_LAST_DEDUPED, deduped).apply()
+        return ResearchMergeResult(sorted, added, deduped)
+    }
+
+    fun clearResearchItems(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_RESEARCH_ITEMS, "[]")
+            .putInt(KEY_RESEARCH_LAST_DEDUPED, 0)
+            .apply()
+    }
+
+    fun researchLastDedupedCount(context: Context): Int {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getInt(KEY_RESEARCH_LAST_DEDUPED, 0)
+    }
+
+    fun researchExportText(context: Context): String {
+        val inputs = loadResearchInputs(context)
+        val items = sortResearchItems(loadResearchItems(context), inputs.sortPreference)
+        val sb = StringBuilder()
+        sb.append("话题找素材链接清单\n")
+        sb.append("平台：${inputs.platform} · 话题：${inputs.topic.ifBlank { "未填写" }} · 类型：${inputs.contentType} · 排序：${inputs.sortPreference} · 方式：${inputs.collectionMode}\n")
+        if (items.isEmpty()) {
+            sb.append("暂无采集结果。")
+            return sb.toString()
+        }
+        items.forEachIndexed { index, item ->
+            val linkText = item.link.ifBlank { "待补链接" }
+            val metrics = item.metricsText.ifBlank { "未识别流量" }
+            val time = item.timeText.ifBlank { "未识别时间" }
+            val author = item.author.ifBlank { "未知作者" }
+            sb.append("${index + 1}. [${item.scoreReason}] ${item.title.ifBlank { "未识别标题" }} | $author | $metrics · $time | ${item.contentType} | $linkText\n")
+        }
+        return sb.toString().trim()
+    }
 
     fun saveVideoInputs(context: Context, inputs: VideoInputs) {
         val o = JSONObject()

@@ -54,6 +54,7 @@ object LinkResolver {
     private val youtubeId = Regex("(?:youtube\\.com/watch\\?v=|youtu\\.be/|youtube\\.com/shorts/)([A-Za-z0-9_-]{6,})")
     private val weiboId = Regex("(?:status/|detail/|mblogid=)([A-Za-z0-9]+)")
     private val tiktokId = Regex("video/(\\d{8,})")
+    private val xId = Regex("(?:status/|statuses/)(\\d{6,})")
 
     fun normalize(link: String): String {
         val raw = link.trim()
@@ -159,6 +160,12 @@ object LinkResolver {
                 if (id != null) deep.add(Uri.parse("snssdk1233://aweme/detail/$id"))
                 TargetInfo("TikTok", "com.zhiliaoapp.musically", id, deep)
             }
+            has("x.com", "twitter.com") -> {
+                val id = xId.find(both)?.groupValues?.getOrNull(1)
+                val deep = mutableListOf<Uri>()
+                if (id != null) deep.add(Uri.parse("https://x.com/i/status/$id"))
+                TargetInfo("X/推特", "com.twitter.android", id, deep)
+            }
             else -> null
         }
     }
@@ -172,6 +179,45 @@ object LinkResolver {
             ResolvedLink(uri, target.packageName, "${target.platform}链接，应用内直达")
         } else {
             ResolvedLink(Uri.parse(finalUrl), null, "未识别平台，等待查询非浏览器接管应用")
+        }
+    }
+
+    /**
+     * 从可见文本里尽力提取真实链接/ID。只在文本明确暴露 URL 或平台 ID 时生成链接；
+     * 没有暴露就返回 null，上层保存为“待补链接”，不编造 URL。
+     */
+    fun extractResearchLink(platform: String, text: String): String? {
+        val clean = text.trim()
+        if (clean.isBlank()) return null
+        val url = urlRegex.find(clean)?.value?.trimEnd('。', '，', ',', '）', ')', ']', '】', '"', '\'')
+        if (!url.isNullOrBlank()) {
+            val target = detectKnown(url, url)
+            if (target?.id != null) {
+                return canonicalResearchLink(target.platform, target.id)
+            }
+            return normalize(url)
+        }
+        val id = when (platform) {
+            "抖音" -> douyinId.find(clean)?.groupValues?.getOrNull(1)
+            "快手" -> kuaishouId.find(clean)?.groupValues?.getOrNull(1)
+            "小红书" -> xhsId.find(clean)?.groupValues?.getOrNull(1)
+            "哔哩哔哩", "B站" -> biliId.find(clean)?.groupValues?.getOrNull(1)
+            "X/推特" -> xId.find(clean)?.groupValues?.getOrNull(1)
+            else -> null
+        }
+        return id?.let { canonicalResearchLink(platform, it) }
+    }
+
+    private fun canonicalResearchLink(platform: String, id: String): String? {
+        val cleanId = id.trim()
+        if (cleanId.isBlank()) return null
+        return when (platform) {
+            "抖音" -> "https://www.douyin.com/video/$cleanId"
+            "快手" -> "https://www.kuaishou.com/short-video/$cleanId"
+            "小红书" -> "https://www.xiaohongshu.com/explore/$cleanId"
+            "哔哩哔哩", "B站" -> "https://www.bilibili.com/video/$cleanId"
+            "X/推特" -> "https://x.com/i/status/$cleanId"
+            else -> null
         }
     }
 

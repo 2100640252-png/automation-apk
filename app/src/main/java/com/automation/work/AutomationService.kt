@@ -31,6 +31,11 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * 无障碍屏幕控制服务（v1.8 诊断版）。
@@ -96,6 +101,8 @@ class AutomationService : AccessibilityService() {
         var searchTopic: String = ""
         var searchStage: Int = 0
         var searchAttempts: Int = 0
+        var searchInputVerified: Boolean = false
+        var searchSubmitted: Boolean = false
         var searchCandidateCap: Int = 10
         var searchSessionKeys: MutableSet<String> = linkedSetOf()
         var currentTargetKey: String = ""
@@ -251,6 +258,55 @@ class AutomationService : AccessibilityService() {
                 return
             }
             instance?.startSearchAssistInternal(platform, topic.trim(), quantity.coerceIn(1, 100))
+        }
+
+        fun startResearchSearch(context: Context, inputs: TaskStore.ResearchInputs) {
+            val gate = gateFailureReason()
+            if (gate != null) {
+                lastStatus = gate
+                TaskStore.appendLog(context, gate)
+                return
+            }
+            if (inputs.topic.isBlank()) {
+                lastStatus = "话题找素材失败：先填写话题。"
+                TaskStore.appendLog(context, lastStatus)
+                return
+            }
+            TaskStore.saveResearchInputs(context, inputs)
+            instance?.startResearchSearchInternal(inputs)
+        }
+
+        fun collectVisibleResearch(context: Context, inputs: TaskStore.ResearchInputs) {
+            val svc = instance
+            if (svc == null) {
+                lastStatus = "话题找素材失败：无障碍服务没在运行，请先开启无障碍。"
+                TaskStore.appendLog(context, lastStatus)
+                return
+            }
+            TaskStore.saveResearchInputs(context, inputs)
+            svc.collectVisibleResearchInternal(inputs)
+        }
+
+        fun recordCurrentResearchLink(context: Context, inputs: TaskStore.ResearchInputs) {
+            val svc = instance
+            if (svc == null) {
+                lastStatus = "记录当前链接失败：无障碍服务没在运行，请先开启无障碍。"
+                TaskStore.appendLog(context, lastStatus)
+                return
+            }
+            TaskStore.saveResearchInputs(context, inputs)
+            svc.recordCurrentResearchLinkInternal(inputs)
+        }
+
+        fun collectPublicResearch(context: Context, inputs: TaskStore.ResearchInputs) {
+            val svc = instance
+            if (svc == null) {
+                lastStatus = "公开网页采集失败：无障碍服务没在运行，请先开启无障碍。"
+                TaskStore.appendLog(context, lastStatus)
+                return
+            }
+            TaskStore.saveResearchInputs(context, inputs)
+            svc.collectPublicResearchInternal(inputs)
         }
 
         fun startCommentCurrentPage(context: Context, platform: String, comment: String) {
@@ -517,6 +573,8 @@ class AutomationService : AccessibilityService() {
     private var syncPollAttempts: Int = 0
     private var lastEventClassName: String = ""
     private var searchRunnable: Runnable? = null
+    private var researchMode: Boolean = false
+    private var researchInputs: TaskStore.ResearchInputs = TaskStore.ResearchInputs()
 
     private data class NodeSignature(
         val text: String,
@@ -560,6 +618,16 @@ class AutomationService : AccessibilityService() {
         val nodeSignature: String,
         val evidence: String,
         val confidence: Int
+    )
+
+    private data class ResearchTextEntry(
+        val bounds: Rect,
+        val text: String
+    )
+
+    private data class ResearchCard(
+        val bounds: Rect,
+        val texts: List<String>
     )
 
     override fun onServiceConnected() {
@@ -758,14 +826,129 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun packageForPlatform(platform: String): String {
-        return when (platform) {
-            "抖音" -> "com.ss.android.ugc.aweme"
-            "快手" -> "com.smile.gifmaker"
-            "小红书" -> "com.xingin.xhs"
-            "哔哩哔哩" -> "com.bilibili.app.in"
-            "微博" -> "com.sina.weibo"
-            else -> ""
+        return PlatformRegistry.packageFor(platform)
+    }
+
+    private fun currentForegroundPackage(): String {
+        return rootInActiveWindow?.packageName?.toString()?.ifBlank { "未知" } ?: "未知"
+    }
+
+    private fun searchFailureMessage(
+        category: String,
+        step: String,
+        platform: String,
+        expectedPackage: String,
+        actualPackage: String,
+        cause: String,
+        nextStep: String
+    ): String {
+        return "失败类别：$category\n步骤：$step\n平台：$platform\n期望包名：$expectedPackage\n实际前台包名：${actualPackage.ifBlank { "未知" }}\n原因：$cause\n下一步：$nextStep"
+    }
+
+    private fun failSearchCategory(
+        category: String,
+        step: String,
+        info: PlatformRegistry.PlatformInfo?,
+        actualPackage: String,
+        cause: String,
+        nextStep: String
+    ) {
+        val platform = info?.label ?: searchPlatform.ifBlank { "未知平台" }
+        val expected = info?.packageName ?: searchPackage.ifBlank { "未知" }
+        val message = searchFailureMessage(category, step, platform, expected, actualPackage, cause, nextStep)
+        failSearch(message)
+    }
+
+    private fun researchFailure(
+        category: String,
+        step: String,
+        info: PlatformRegistry.PlatformInfo,
+        actualPackage: String,
+        cause: String,
+        nextStep: String
+    ): String {
+        val message = searchFailureMessage(category, step, info.label, info.packageName, actualPackage, cause, nextStep)
+        lastStatus = message
+        TaskStore.appendLog(this, message)
+        showInterventionPanel(message, pauseAutomation = false)
+        return message
+    }
+
+    private fun loginOrSecurityCategory(text: String): String? {
+        if (isSecurityBlock(text)) return "SEARCH_CAPTCHA_OR_SECURITY"
+        if (isLoginBlock(text)) return "SEARCH_LOGIN_REQUIRED"
+        return null
+    }
+
+    private fun loginOrSecurityNextStep(category: String): String {
+        return if (category == "SEARCH_CAPTCHA_OR_SECURITY") {
+            "请手动完成验证码/安全验证后重试；软件不会绕过安全检查。"
+        } else {
+            "请先在所选 App 登录后重试；软件不会代替登录。"
         }
+    }
+
+    private fun hasNoResultsText(text: String): Boolean {
+        return listOf("没有找到", "暂无结果", "无搜索结果", "没有相关", "未找到相关", "No results", "No results found", "no results").any { text.contains(it, ignoreCase = true) }
+    }
+
+    private fun verifiedSearchResults(root: AccessibilityNodeInfo, info: PlatformRegistry.PlatformInfo): Boolean {
+        val snapshot = captureWindowSnapshot(searchTopic, "")
+        if (snapshot.pkg != info.packageName) return false
+        val cards = extractResearchCards(root)
+        if (cards.isNotEmpty()) return true
+        val text = treeText(root)
+        if (hasNoResultsText(text)) return false
+        val resultTabs = listOf("综合", "视频", "用户", "图文", "笔记", "搜索结果", "相关搜索", "作品").any { text.contains(it) }
+        return snapshot.hasResults && resultTabs && text.contains(searchTopic)
+    }
+
+    private fun platformInfoOrFail(platform: String): PlatformRegistry.PlatformInfo? {
+        val info = PlatformRegistry.find(platform)
+        if (info == null) {
+            val message = searchFailureMessage(
+                category = "SEARCH_UNSUPPORTED_PLATFORM_MODE",
+                step = "平台校验",
+                platform = platform,
+                expectedPackage = "未内置",
+                actualPackage = currentForegroundPackage(),
+                cause = "未内置平台：$platform",
+                nextStep = "请选择内置平台后重试；已停止，不回退其他平台或浏览器。"
+            )
+            lastStatus = message
+            TaskStore.appendLog(this, message)
+            showInterventionPanel(message, pauseAutomation = false)
+            return null
+        }
+        if (!info.supported) {
+            val message = searchFailureMessage(
+                category = "SEARCH_UNSUPPORTED_PLATFORM_MODE",
+                step = "平台校验",
+                platform = info.label,
+                expectedPackage = info.packageName,
+                actualPackage = currentForegroundPackage(),
+                cause = info.unsupportedReason,
+                nextStep = "请选择支持的平台后重试；已停止，不回退其他平台或浏览器。"
+            )
+            lastStatus = message
+            TaskStore.appendLog(this, message)
+            showInterventionPanel(message, pauseAutomation = false)
+            return null
+        }
+        TaskStore.appendLog(this, PlatformRegistry.routeSummary(info.label))
+        return info
+    }
+
+    private fun searchHintScore(node: AccessibilityNodeInfo, info: PlatformRegistry.PlatformInfo?): Int {
+        if (info == null) return 0
+        val text = nodeText(node)
+        val viewId = node.viewIdResourceName ?: ""
+        var score = 0
+        if (info.searchTexts.any { it.isNotBlank() && text.contains(it, ignoreCase = true) }) score += 700
+        if (info.searchDescriptions.any { it.isNotBlank() && text.contains(it, ignoreCase = true) }) score += 500
+        if (info.searchViewIdHints.any { it.isNotBlank() && viewId.contains(it, ignoreCase = true) }) score += 900
+        if (viewId.contains("search", ignoreCase = true)) score += 350
+        return score
     }
 
     private fun nodeSignature(node: AccessibilityNodeInfo): NodeSignature {
@@ -852,7 +1035,8 @@ class AutomationService : AccessibilityService() {
         return labelMatch
     }
 
-    private fun findSearchBox(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+    private fun findSearchBox(root: AccessibilityNodeInfo, platform: String = ""): AccessibilityNodeInfo? {
+        val info = PlatformRegistry.find(platform.ifBlank { searchPlatform })
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         var best: AccessibilityNodeInfo? = null
@@ -863,7 +1047,7 @@ class AutomationService : AccessibilityService() {
             if (node.isEditable) {
                 val text = nodeText(node)
                 val b = nodeBounds(node)
-                var score = 0
+                var score = searchHintScore(node, info)
                 if (text.contains("搜索") || text.contains("search", ignoreCase = true)) score += 800
                 if (node.isFocused) score += 300
                 if (b.centerY() < rootBounds.height() * 0.45) score += 250
@@ -878,7 +1062,8 @@ class AutomationService : AccessibilityService() {
         return if (bestScore >= 250) best else null
     }
 
-    private fun findSearchEntry(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+    private fun findSearchEntry(root: AccessibilityNodeInfo, platform: String = ""): AccessibilityNodeInfo? {
+        val info = PlatformRegistry.find(platform.ifBlank { searchPlatform })
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         var best: AccessibilityNodeInfo? = null
@@ -886,9 +1071,10 @@ class AutomationService : AccessibilityService() {
         while (queue.isNotEmpty()) {
             val node = queue.removeFirst()
             val text = nodeText(node)
-            if (text.contains("搜索") || text.contains("search", ignoreCase = true)) {
+            val hintScore = searchHintScore(node, info)
+            if (hintScore > 0 || text.contains("搜索") || text.contains("search", ignoreCase = true)) {
                 val target = clickableAncestor(node) ?: node
-                var score = nodeBounds(target).centerY()
+                var score = hintScore + nodeBounds(target).centerY()
                 if (clickableAncestor(node) != null) score += 500
                 if (score > bestScore) {
                     bestScore = score
@@ -900,7 +1086,8 @@ class AutomationService : AccessibilityService() {
         return best
     }
 
-    private fun findSearchSubmit(root: AccessibilityNodeInfo, input: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+    private fun findSearchSubmit(root: AccessibilityNodeInfo, input: AccessibilityNodeInfo?, platform: String = ""): AccessibilityNodeInfo? {
+        val info = PlatformRegistry.find(platform.ifBlank { searchPlatform })
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
         val inputBounds = input?.let { nodeBounds(it) }
@@ -909,11 +1096,12 @@ class AutomationService : AccessibilityService() {
         while (queue.isNotEmpty()) {
             val node = queue.removeFirst()
             val text = nodeText(node)
-            if (listOf("搜索", "Search", "确定").any { text.contains(it) }) {
+            val hintScore = searchHintScore(node, info)
+            if (hintScore > 0 || listOf("搜索", "Search", "确定").any { text.contains(it) }) {
                 val target = clickableAncestor(node) ?: node
                 if (target === input) continue
                 val b = nodeBounds(target)
-                var score = 0
+                var score = hintScore
                 if (clickableAncestor(node) != null) score += 500
                 if (inputBounds != null && kotlin.math.abs(b.centerY() - inputBounds.centerY()) < 220) score += 300
                 if (b.centerX() > nodeBounds(root).width() * 0.55) score += 150
@@ -927,13 +1115,13 @@ class AutomationService : AccessibilityService() {
         return best
     }
 
-    private fun findRoleNode(root: AccessibilityNodeInfo, role: String): AccessibilityNodeInfo? {
+    private fun findRoleNode(root: AccessibilityNodeInfo, role: String, platform: String = ""): AccessibilityNodeInfo? {
         return when (PointStore.kindToRole(role)) {
             PointStore.ROLE_COMMENT_ENTRY -> findCommentEntry(root) ?: findPlaceholderInput(root)
             PointStore.ROLE_COMMENT_INPUT -> findEditableCommentBox(root)
             PointStore.ROLE_SEND -> findSendButton(root, findEditableCommentBox(root))?.first
-            PointStore.ROLE_SEARCH_BOX -> findSearchBox(root) ?: findSearchEntry(root)
-            PointStore.ROLE_SEARCH_SUBMIT -> findSearchSubmit(root, findSearchBox(root))
+            PointStore.ROLE_SEARCH_BOX -> findSearchBox(root, platform) ?: findSearchEntry(root, platform)
+            PointStore.ROLE_SEARCH_SUBMIT -> findSearchSubmit(root, findSearchBox(root, platform), platform)
             PointStore.ROLE_VIDEO_RESULT -> findVideoResultNode(root)
             else -> null
         }
@@ -1013,7 +1201,7 @@ class AutomationService : AccessibilityService() {
             }, if (normalizedRole == PointStore.ROLE_SEND) 1500L else 1000L)
         }
         val root = rootInActiveWindow
-        val node = root?.let { findNodeBySignature(it, point.nodeSignature) ?: findRoleNode(it, normalizedRole) }
+        val node = root?.let { findNodeBySignature(it, point.nodeSignature) ?: findRoleNode(it, normalizedRole, platform) }
         if (node != null) {
             if (clickNode(node)) {
                 TaskStore.appendLog(this, "$label：已按语义签名/角色控件点击，等待转换验证")
@@ -1343,40 +1531,63 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun startSearchAssistInternal(platform: String, topic: String, quantity: Int) {
-        val pkg = packageForPlatform(platform)
-        if (pkg.isBlank()) {
-            lastStatus = "搜索辅助失败：不支持的平台 $platform"
-            TaskStore.appendLog(this, lastStatus)
-            return
-        }
+        val info = platformInfoOrFail(platform) ?: return
+        val pkg = info.packageName
         val launch = packageManager.getLaunchIntentForPackage(pkg)
         if (launch == null) {
-            lastStatus = "搜索辅助失败：手机没装 $platform（$pkg）"
-            TaskStore.appendLog(this, lastStatus)
-            showInterventionPanel(lastStatus, pauseAutomation = false)
+            val message = searchFailureMessage(
+                category = "SEARCH_APP_NOT_INSTALLED",
+                step = "检查 App",
+                platform = info.label,
+                expectedPackage = pkg,
+                actualPackage = currentForegroundPackage(),
+                cause = "手机没装 ${info.label}，需要下载/安装所选 App；这不是搜索框缺失。",
+                nextStep = "下载/安装 ${info.label} 并登录后重试；已停止，不回退其他平台或浏览器。"
+            )
+            lastStatus = message
+            TaskStore.appendLog(this, message)
+            showInterventionPanel(message, pauseAutomation = false)
             return
         }
         searchRunning = true
-        searchPlatform = platform
+        searchPlatform = info.label
         searchPackage = pkg
         searchTopic = topic
         searchCandidateCap = quantity.coerceIn(1, 100)
         searchSessionKeys = linkedSetOf()
         searchStage = 0
         searchAttempts = 0
-        expectedPlatform = platform
+        searchInputVerified = false
+        searchSubmitted = false
+        expectedPlatform = info.label
         expectedPackage = pkg
         pausedForHuman = false
         showMiniOverlay()
-        lastStatus = "搜索辅助开始：打开 $platform 搜索“$topic”，候选确认上限 $searchCandidateCap 条；停在结果页，不自动评论。"
+        lastStatus = "搜索辅助开始：打开 ${info.label}（$pkg）搜索“$topic”，候选确认上限 $searchCandidateCap 条；停在结果页，不自动评论。"
         TaskStore.appendLog(this, lastStatus)
         try {
             launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             startActivity(launch)
             scheduleSearchStep(2500L)
         } catch (e: Exception) {
-            failSearch("搜索辅助失败：打开 $platform 出错 ${e.javaClass.simpleName}: ${e.message}")
+            failSearchCategory(
+                category = "SEARCH_APP_OPEN_FAILED",
+                step = "打开 App",
+                info = info,
+                actualPackage = currentForegroundPackage(),
+                cause = "启动 ${info.label} 失败：${e.javaClass.simpleName}: ${e.message}",
+                nextStep = "请手动打开 ${info.label} 后重试；已停止，不回退其他平台或浏览器。"
+            )
         }
+    }
+
+    private fun startResearchSearchInternal(inputs: TaskStore.ResearchInputs) {
+        val info = platformInfoOrFail(inputs.platform) ?: return
+        researchInputs = inputs.copy(platform = info.label, limit = inputs.limit.coerceIn(1, 100))
+        researchMode = true
+        TaskStore.appendLog(this, "话题找素材开始：${PlatformRegistry.routeSummary(info.label)}，话题=“${researchInputs.topic}”，类型=${researchInputs.contentType}，排序=${researchInputs.sortPreference}，采集上限=${researchInputs.limit}；只采集链接清单，不自动评论。")
+        startSearchAssistInternal(info.label, researchInputs.topic, researchInputs.limit)
+        if (!searchRunning) researchMode = false
     }
 
     private fun failSearch(reason: String) {
@@ -1387,54 +1598,125 @@ class AutomationService : AccessibilityService() {
         showInterventionPanel(reason, pauseAutomation = false)
     }
 
-    private fun fillSearchText(input: AccessibilityNodeInfo, topic: String): Boolean {
+    private fun fillSearchText(input: AccessibilityNodeInfo, topic: String): Pair<Boolean, String> {
         if (setText(input, topic)) {
-            val fresh = rootInActiveWindow?.let { findSearchBox(it) } ?: input
-            if ((fresh.text?.toString() ?: "").contains(topic)) return true
+            val fresh = rootInActiveWindow?.let { findSearchBox(it, searchPlatform) } ?: input
+            val actual = fresh.text?.toString() ?: ""
+            if (actual.contains(topic)) return true to actual
         }
-        val fresh = rootInActiveWindow?.let { findSearchBox(it) } ?: input
-        return pasteText(fresh, topic, topic)
+        val fresh = rootInActiveWindow?.let { findSearchBox(it, searchPlatform) } ?: input
+        val pasted = pasteText(fresh, topic, topic)
+        val after = rootInActiveWindow?.let { findSearchBox(it, searchPlatform) } ?: fresh
+        val actual = after.text?.toString() ?: ""
+        return (pasted && actual.contains(topic)) to actual
     }
 
     private fun trySearchStep() {
         if (!searchRunning || pausedForHuman || semanticTapInProgress) return
+        val info = PlatformRegistry.find(searchPlatform)
+        if (info == null) {
+            failSearchCategory(
+                category = "SEARCH_UNSUPPORTED_PLATFORM_MODE",
+                step = "平台校验",
+                info = null,
+                actualPackage = currentForegroundPackage(),
+                cause = "未内置平台：$searchPlatform",
+                nextStep = "请选择内置平台后重试；已停止，不回退其他平台或浏览器。"
+            )
+            return
+        }
         val root = rootInActiveWindow ?: run {
             searchAttempts++
-            if (searchAttempts >= 5) failSearch("搜索辅助失败：拿不到当前窗口，期望包名=$searchPackage") else scheduleSearchStep(2000L)
+            if (searchAttempts >= 5) {
+                failSearchCategory(
+                    category = "SEARCH_WRONG_FOREGROUND",
+                    step = "验证前台 App",
+                    info = info,
+                    actualPackage = "未知",
+                    cause = "超时后拿不到当前窗口，无法验证所选 App 已到前台。",
+                    nextStep = "请手动打开 ${searchPlatform} 后重试；已停止，不回退其他平台或浏览器。"
+                )
+            } else scheduleSearchStep(2000L)
             return
         }
         val pkg = root.packageName?.toString() ?: ""
         if (pkg in browserPackages) {
-            failSearch("搜索辅助失败：浏览器在前台（实际包名=$pkg），已停止，不用浏览器页面状态作证明")
+            failSearchCategory(
+                category = "SEARCH_WRONG_FOREGROUND",
+                step = "验证前台 App",
+                info = info,
+                actualPackage = pkg,
+                cause = "浏览器在前台，已停止，不用浏览器页面状态作证明。",
+                nextStep = "请打开 ${searchPlatform} App 后重试；不要用浏览器打开搜索。"
+            )
             return
         }
         if (pkg != searchPackage) {
             searchAttempts++
             TaskStore.appendLog(this, "搜索辅助验证窗口：期望前台包名=$searchPackage，实际前台包名=$pkg（第 $searchAttempts 次）")
-            if (searchAttempts >= 5) failSearch("搜索辅助失败：超时后 $searchPlatform 仍未到前台（期望包名=$searchPackage，实际包名=$pkg）") else scheduleSearchStep(2000L)
+            if (searchAttempts >= 5) {
+                failSearchCategory(
+                    category = "SEARCH_WRONG_FOREGROUND",
+                    step = "验证前台 App",
+                    info = info,
+                    actualPackage = pkg,
+                    cause = "超时后 $searchPlatform 仍未到前台。",
+                    nextStep = "请确认 ${searchPlatform} 已安装并手动打开到前台后重试；已停止，不回退其他平台或浏览器。"
+                )
+            } else scheduleSearchStep(2000L)
             return
         }
         val allText = treeText(root)
-        if (isLoginBlock(allText) || isSecurityBlock(allText)) {
-            failSearch("搜索辅助失败：$searchPlatform 出现登录或安全检查，已停止自动操作")
+        val blockCategory = loginOrSecurityCategory(allText)
+        if (blockCategory != null && !verifiedSearchResults(root, info)) {
+            failSearchCategory(
+                category = blockCategory,
+                step = "验证登录/安全状态",
+                info = info,
+                actualPackage = pkg,
+                cause = if (blockCategory == "SEARCH_CAPTCHA_OR_SECURITY") "$searchPlatform 出现验证码或安全检查。" else "$searchPlatform 需要登录后才能继续搜索。",
+                nextStep = loginOrSecurityNextStep(blockCategory)
+            )
+            return
+        }
+        if (hasNoResultsText(allText) && searchSubmitted) {
+            failSearchCategory(
+                category = "SEARCH_NO_RESULTS",
+                step = "验证结果页",
+                info = info,
+                actualPackage = pkg,
+                cause = "已进入搜索结果页，但页面提示没有结果或没有可见结果卡片。",
+                nextStep = "请换一个话题，或手动调整筛选后重试。"
+            )
             return
         }
         when (searchStage) {
             0 -> {
-                val input = findSearchBox(root)
+                val input = findSearchBox(root, searchPlatform)
                 if (input != null) {
                     clickNode(input)
                     input.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
                     handler.postDelayed({
-                        val fresh = rootInActiveWindow?.let { findSearchBox(it) } ?: input
-                        if (fillSearchText(fresh, searchTopic)) {
+                        val fresh = rootInActiveWindow?.let { findSearchBox(it, searchPlatform) } ?: input
+                        val fill = fillSearchText(fresh, searchTopic)
+                        if (fill.first) {
+                            searchInputVerified = true
                             searchStage = 1
                             searchAttempts = 0
                             TaskStore.appendLog(this, "搜索框已填入话题：$searchTopic，准备提交搜索")
                             scheduleSearchStep(900L)
                         } else {
                             searchAttempts++
-                            if (searchAttempts >= 4) failSearch("搜索辅助失败：话题填不进搜索框") else scheduleSearchStep(1500L)
+                            if (searchAttempts >= 4) {
+                                failSearchCategory(
+                                    category = "SEARCH_INPUT_FAILED",
+                                    step = "输入话题",
+                                    info = info,
+                                    actualPackage = currentForegroundPackage(),
+                                    cause = "搜索框已找到，但文本设置/粘贴失败或文本不匹配；期望话题=“$searchTopic”，实际文本=“${fill.second.take(60)}”。",
+                                    nextStep = "请先同步识别该平台搜索框（SEARCH_BOX，平台=$searchPlatform，期望包名=$searchPackage），或手动输入话题后重试。"
+                                )
+                            } else scheduleSearchStep(1500L)
                         }
                     }, 700L)
                     return
@@ -1444,12 +1726,21 @@ class AutomationService : AccessibilityService() {
                     executeSemanticPoint(searchPlatform, PointStore.ROLE_SEARCH_BOX, "搜索框", searchTopic, "") { _, transitionOk, msg ->
                         if (transitionOk) scheduleSearchStep(800L) else {
                             searchAttempts++
-                            if (searchAttempts >= 3) failSearch("搜索辅助失败：搜索框语义点位没有产生期望转换。$msg") else scheduleSearchStep(1500L)
+                            if (searchAttempts >= 3) {
+                                failSearchCategory(
+                                    category = "SEARCH_BOX_NOT_FOUND",
+                                    step = "找搜索框",
+                                    info = info,
+                                    actualPackage = currentForegroundPackage(),
+                                    cause = "正确 App 已在前台，但搜索框语义点位没有产生期望转换。$msg",
+                                    nextStep = "请先同步识别该平台搜索框（SEARCH_BOX，平台=$searchPlatform，期望包名=$searchPackage）。"
+                                )
+                            } else scheduleSearchStep(1500L)
                         }
                     }
                     return
                 }
-                val entry = findSearchEntry(root)
+                val entry = findSearchEntry(root, searchPlatform)
                 if (entry != null) {
                     if (clickNode(entry)) {
                         TaskStore.appendLog(this, "搜索框：已点搜索入口，等待搜索输入框出现")
@@ -1458,31 +1749,60 @@ class AutomationService : AccessibilityService() {
                         tapNodeCenter(entry, "搜索框") { ok ->
                             if (ok) scheduleSearchStep(1200L) else {
                                 searchAttempts++
-                                if (searchAttempts >= 3) failSearch("搜索辅助失败：搜索入口点击手势失败") else scheduleSearchStep(1500L)
+                                if (searchAttempts >= 3) {
+                                    failSearchCategory(
+                                        category = "SEARCH_BOX_NOT_FOUND",
+                                        step = "找搜索框",
+                                        info = info,
+                                        actualPackage = currentForegroundPackage(),
+                                        cause = "正确 App 已在前台，但搜索入口点击后没有出现可用搜索框。",
+                                        nextStep = "请先同步识别该平台搜索框（SEARCH_BOX，平台=$searchPlatform，期望包名=$searchPackage）。"
+                                    )
+                                } else scheduleSearchStep(1500L)
                             }
                         }
                     }
                     return
                 }
                 searchAttempts++
-                if (searchAttempts >= 4) failSearch("搜索辅助失败：页面里没有搜索框或搜索入口，请先同步识别搜索框") else scheduleSearchStep(2000L)
+                if (searchAttempts >= 4) {
+                    failSearchCategory(
+                        category = "SEARCH_BOX_NOT_FOUND",
+                        step = "找搜索框",
+                        info = info,
+                        actualPackage = pkg,
+                        cause = "正确 App 已在前台，但没有找到搜索入口或搜索输入框；这不是未安装。",
+                        nextStep = "请先同步识别该平台搜索框（SEARCH_BOX，平台=$searchPlatform，期望包名=$searchPackage）；已停止，不回退其他平台或浏览器。"
+                    )
+                } else scheduleSearchStep(2000L)
             }
             1 -> {
-                val input = findSearchBox(root)
-                val submit = findSearchSubmit(root, input)
+                val input = findSearchBox(root, searchPlatform)
+                val submit = findSearchSubmit(root, input, searchPlatform)
                 if (submit != null) {
                     if (clickNode(submit)) {
+                        searchSubmitted = true
                         searchStage = 2
                         TaskStore.appendLog(this, "搜索提交：已点搜索提交控件，等待结果页验证")
                         scheduleSearchStep(1600L)
                     } else {
                         tapNodeCenter(submit, "搜索提交") { ok ->
                             if (ok) {
+                                searchSubmitted = true
                                 searchStage = 2
                                 scheduleSearchStep(1600L)
                             } else {
                                 searchAttempts++
-                                if (searchAttempts >= 3) failSearch("搜索辅助失败：搜索提交点击手势失败") else scheduleSearchStep(1500L)
+                                if (searchAttempts >= 3) {
+                                    failSearchCategory(
+                                        category = "SEARCH_SUBMIT_FAILED",
+                                        step = "提交搜索",
+                                        info = info,
+                                        actualPackage = currentForegroundPackage(),
+                                        cause = "话题已输入，但搜索提交点击没有触发结果转换。",
+                                        nextStep = "请手动点搜索提交后重试，或同步识别搜索提交点位。"
+                                    )
+                                } else scheduleSearchStep(1500L)
                             }
                         }
                     }
@@ -1492,38 +1812,638 @@ class AutomationService : AccessibilityService() {
                 if (point != null) {
                     executeSemanticPoint(searchPlatform, PointStore.ROLE_SEARCH_SUBMIT, "搜索提交", searchTopic, "") { gestureOk, transitionOk, msg ->
                         if (gestureOk) {
+                            searchSubmitted = true
                             searchStage = 2
                             scheduleSearchStep(1200L)
                         } else if (!transitionOk) {
                             searchAttempts++
-                            if (searchAttempts >= 3) failSearch("搜索辅助失败：搜索提交语义点位失败。$msg") else scheduleSearchStep(1500L)
+                            if (searchAttempts >= 3) {
+                                failSearchCategory(
+                                    category = "SEARCH_SUBMIT_FAILED",
+                                    step = "提交搜索",
+                                    info = info,
+                                    actualPackage = currentForegroundPackage(),
+                                    cause = "话题已输入，但搜索提交语义点位没有产生结果转换。$msg",
+                                    nextStep = "请手动点搜索提交后重试，或同步识别搜索提交点位。"
+                                )
+                            } else scheduleSearchStep(1500L)
                         }
                     }
                     return
                 }
                 if (input != null && input.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)) {
+                    searchSubmitted = true
                     searchStage = 2
                     TaskStore.appendLog(this, "搜索提交：已用键盘回车提交，等待结果页验证")
                     scheduleSearchStep(1600L)
                     return
                 }
                 searchAttempts++
-                if (searchAttempts >= 4) failSearch("搜索辅助失败：找不到搜索提交控件，请先同步识别搜索提交") else scheduleSearchStep(1500L)
+                if (searchAttempts >= 4) {
+                    failSearchCategory(
+                        category = "SEARCH_SUBMIT_FAILED",
+                        step = "提交搜索",
+                        info = info,
+                        actualPackage = pkg,
+                        cause = "话题已输入（输入验证=$searchInputVerified），但没有找到搜索提交控件或回车没有触发结果转换。",
+                        nextStep = "请手动点搜索提交后重试，或同步识别搜索提交点位；已停止，不回退其他平台或浏览器。"
+                    )
+                } else scheduleSearchStep(1500L)
             }
             else -> {
                 val snapshot = captureWindowSnapshot(searchTopic, "")
-                if (snapshot.hasResults) {
+                if (verifiedSearchResults(root, info)) {
                     searchRunning = false
-                    lastStatus = "搜索辅助已停在结果页：话题“$searchTopic”，候选确认上限 $searchCandidateCap 条。请手动选择一条视频，确认后再点“评论这一条”。"
-                    TaskStore.appendLog(this, "搜索辅助停在结果页：${snapshotSummary(snapshot)}")
+                    lastStatus = if (researchMode) {
+                        "话题找素材已停在结果页：话题“$searchTopic”，已验证 ${info.label}（${info.packageName}）前台和结果卡片/结果状态；请手动滑动后点“采集当前可见”；只采集链接清单，不自动评论。"
+                    } else {
+                        "搜索辅助已停在结果页：话题“$searchTopic”，已验证 ${info.label}（${info.packageName}）前台和结果卡片/结果状态；候选确认上限 $searchCandidateCap 条。请手动选择一条视频，确认后再点“评论这一条”。"
+                    }
+                    TaskStore.appendLog(this, if (researchMode) "话题找素材停在结果页：${snapshotSummary(snapshot)}" else "搜索辅助停在结果页：${snapshotSummary(snapshot)}")
+                    researchMode = false
                     showMiniOverlay()
                 } else {
                     searchAttempts++
-                    TaskStore.appendLog(this, "搜索辅助验证结果页：还没验证到结果页（第 $searchAttempts 次）${snapshotSummary(snapshot)}")
-                    if (searchAttempts >= 5) failSearch("搜索辅助失败：提交后没验证到结果页") else scheduleSearchStep(1800L)
+                    TaskStore.appendLog(this, "搜索辅助验证结果页：还没验证到结果卡片/结果状态（第 $searchAttempts 次）${snapshotSummary(snapshot)}")
+                    if (searchAttempts >= 5) {
+                        failSearchCategory(
+                            category = "SEARCH_SUBMIT_FAILED",
+                            step = "验证结果页",
+                            info = info,
+                            actualPackage = pkg,
+                            cause = "话题已输入并提交（输入验证=$searchInputVerified，提交=$searchSubmitted），但没有验证到结果卡片或结果状态转换。",
+                            nextStep = "请确认已停在 ${searchPlatform} 搜索结果页；若页面提示无结果，请换话题重试。"
+                        )
+                    } else scheduleSearchStep(1800L)
                 }
             }
         }
+    }
+
+    private fun verifyResearchForeground(info: PlatformRegistry.PlatformInfo, action: String): AccessibilityNodeInfo? {
+        val root = rootInActiveWindow
+        if (root == null) {
+            researchFailure(
+                category = "SEARCH_WRONG_FOREGROUND",
+                step = action,
+                info = info,
+                actualPackage = "未知",
+                cause = "拿不到当前窗口，无法验证所选 App 已到前台。",
+                nextStep = "请打开 ${info.label} 搜索结果页后重试。"
+            )
+            return null
+        }
+        val pkg = root.packageName?.toString() ?: ""
+        if (pkg in browserPackages) {
+            researchFailure(
+                category = "SEARCH_WRONG_FOREGROUND",
+                step = action,
+                info = info,
+                actualPackage = pkg,
+                cause = "浏览器在前台，已停止，不用浏览器页面采集。",
+                nextStep = "请打开 ${info.label} App 搜索结果页后重试。"
+            )
+            return null
+        }
+        if (pkg != info.packageName) {
+            researchFailure(
+                category = "SEARCH_WRONG_FOREGROUND",
+                step = action,
+                info = info,
+                actualPackage = pkg.ifBlank { "未知" },
+                cause = "当前前台不是所选 App。",
+                nextStep = "请先打开 ${info.label} 搜索结果页后重试。"
+            )
+            return null
+        }
+        val allText = treeText(root)
+        val blockCategory = loginOrSecurityCategory(allText)
+        if (blockCategory != null) {
+            researchFailure(
+                category = blockCategory,
+                step = action,
+                info = info,
+                actualPackage = pkg,
+                cause = if (blockCategory == "SEARCH_CAPTCHA_OR_SECURITY") "${info.label} 出现验证码或安全检查，已停止采集。" else "${info.label} 需要登录后才能继续采集。",
+                nextStep = loginOrSecurityNextStep(blockCategory)
+            )
+            return null
+        }
+        return root
+    }
+
+    private fun collectVisibleResearchInternal(inputs: TaskStore.ResearchInputs) {
+        val info = platformInfoOrFail(inputs.platform) ?: return
+        researchInputs = inputs.copy(platform = info.label, limit = inputs.limit.coerceIn(1, 100))
+        val root = verifyResearchForeground(info, "采集当前可见") ?: return
+        val cards = extractResearchCards(root)
+        val items = cards.mapNotNull { researchItemFromCard(info, researchInputs, it) }
+        if (items.isEmpty()) {
+            researchFailure(
+                category = "SEARCH_COLLECT_NO_VISIBLE_CARDS",
+                step = "采集当前可见",
+                info = info,
+                actualPackage = root.packageName?.toString() ?: info.packageName,
+                cause = "当前可见区域没有识别到素材卡片。",
+                nextStep = "请确认已停在 ${info.label} 搜索结果页，或手动滑动后再次点“采集当前可见”。"
+            )
+            return
+        }
+        val merge = TaskStore.addResearchItems(this, items, researchInputs)
+        val top = merge.items.take(3).joinToString("；") { "${it.title.take(24)}（${it.scoreReason}）" }
+        lastStatus = "话题找素材采集完成：新增 ${merge.added}，去重 ${merge.deduped}，当前清单 ${merge.items.size}；请手动滑动后再次点“采集当前可见”。"
+        TaskStore.appendLog(this, "话题找素材采集：平台=${info.label} 话题=${researchInputs.topic} 新增=${merge.added} 去重=${merge.deduped} 当前清单=${merge.items.size} 排序=${researchInputs.sortPreference} 高流量/新发 Top=$top")
+        showMiniOverlay()
+    }
+
+    private fun recordCurrentResearchLinkInternal(inputs: TaskStore.ResearchInputs) {
+        val info = platformInfoOrFail(inputs.platform) ?: return
+        researchInputs = inputs.copy(platform = info.label, limit = inputs.limit.coerceIn(1, 100))
+        val root = verifyResearchForeground(info, "记录当前链接") ?: return
+        val entries = collectResearchTextEntries(root)
+        val texts = entries.map { it.text }.distinct()
+        val combined = (treeText(root) + " " + texts.joinToString(" ")).trim()
+        val link = LinkResolver.extractResearchLink(info.label, combined)
+        val title = chooseResearchTitle(texts, researchInputs.topic).ifBlank { "当前页面素材" }
+        val author = extractResearchAuthor(texts, combined, title)
+        val metric = parseResearchMetric(combined, info)
+        val time = parseResearchTime(combined, info)
+        val contentType = classifyResearchContentType(combined, info)
+        val score = researchScore(metric.first, time.first, researchInputs.sortPreference)
+        val dedupeKey = if (!link.isNullOrBlank()) {
+            "${info.label}|$link"
+        } else {
+            "${info.label}|${normalizedKeyPart(title)}|${normalizedKeyPart(author)}|${metric.first / 1000}"
+        }
+        val item = TaskStore.ResearchItem(
+            platform = info.label,
+            topic = researchInputs.topic,
+            title = title,
+            author = author,
+            metricsText = metric.second,
+            metricScore = metric.first,
+            timeText = time.second,
+            newnessScore = time.first,
+            score = score.first,
+            scoreReason = score.second,
+            contentType = contentType,
+            link = link ?: "",
+            status = if (link.isNullOrBlank()) "待补链接" else "已识别链接",
+            dedupeKey = dedupeKey,
+            capturedAt = System.currentTimeMillis()
+        )
+        val merge = TaskStore.upsertResearchItem(this, item, researchInputs)
+        if (link.isNullOrBlank()) {
+            val message = searchFailureMessage(
+                category = "SEARCH_LINK_NOT_EXPOSED",
+                step = "记录当前链接",
+                platform = info.label,
+                expectedPackage = info.packageName,
+                actualPackage = root.packageName?.toString() ?: info.packageName,
+                cause = "当前页已识别到素材，但没有暴露 URL 或平台 ID；已保存为待补链接，不编造 URL。当前清单 ${merge.items.size} 条。",
+                nextStep = "请打开分享/复制链接页面，或手动补链接后重试。"
+            )
+            lastStatus = message
+            TaskStore.appendLog(this, message)
+        } else {
+            lastStatus = "记录当前链接：已识别链接 $link；当前清单 ${merge.items.size} 条。"
+        }
+        TaskStore.appendLog(this, "话题找素材记录当前链接：平台=${info.label} 标题=${title.take(40)} 作者=${author.ifBlank { "未知" }} 状态=${item.status} 链接=${link ?: "待补链接"} 新增=${merge.added} 去重=${merge.deduped}")
+        showMiniOverlay()
+    }
+
+    private fun collectPublicResearchInternal(inputs: TaskStore.ResearchInputs) {
+        val info = platformInfoOrFail(inputs.platform) ?: return
+        researchInputs = inputs.copy(platform = info.label, limit = inputs.limit.coerceIn(1, 100), collectionMode = "公开网页")
+        if (!info.publicWebSupported) {
+            researchFailure(
+                category = "SEARCH_UNSUPPORTED_PLATFORM_MODE",
+                step = "公开网页采集",
+                info = info,
+                actualPackage = currentForegroundPackage(),
+                cause = info.publicWebReason,
+                nextStep = "请使用 App内搜索，并确保 ${info.packageName} 已安装登录。"
+            )
+            return
+        }
+        lastStatus = "公开网页采集中：${info.label} 只采集公开可见结果，可能不完整；不用于评论有效性证明。"
+        TaskStore.appendLog(this, lastStatus)
+        Thread {
+            val result = runCatching { collectYouTubePublicResearch(info, researchInputs) }
+            handler.post {
+                result.onSuccess { items ->
+                    if (items.isEmpty()) {
+                        researchFailure(
+                            category = "SEARCH_NO_RESULTS",
+                            step = "公开网页采集",
+                            info = info,
+                            actualPackage = currentForegroundPackage(),
+                            cause = "公开网页没有解析到公开可见视频；公开网页结果可能不完整。",
+                            nextStep = "请改用 App内搜索，并确保 ${info.packageName} 已安装登录。"
+                        )
+                    } else {
+                        val merge = TaskStore.addResearchItems(this, items, researchInputs)
+                        lastStatus = "公开网页采集完成：新增 ${merge.added}，去重 ${merge.deduped}，当前清单 ${merge.items.size}；公开网页结果可能不完整。"
+                        TaskStore.appendLog(this, "话题找素材公开网页采集：平台=${info.label} 话题=${researchInputs.topic} 新增=${merge.added} 去重=${merge.deduped} 当前清单=${merge.items.size}；只采集公开可见链接，不自动评论。")
+                        showMiniOverlay()
+                    }
+                }.onFailure { e ->
+                    researchFailure(
+                        category = "SEARCH_UNSUPPORTED_PLATFORM_MODE",
+                        step = "公开网页采集",
+                        info = info,
+                        actualPackage = currentForegroundPackage(),
+                        cause = "公开网页模式本次不可用：${e.javaClass.simpleName}: ${e.message}",
+                        nextStep = "请改用 App内搜索，并确保 ${info.packageName} 已安装登录。"
+                    )
+                }
+            }
+        }.start()
+    }
+
+    private fun collectYouTubePublicResearch(info: PlatformRegistry.PlatformInfo, inputs: TaskStore.ResearchInputs): List<TaskStore.ResearchItem> {
+        val query = URLEncoder.encode(inputs.topic, "UTF-8")
+        val url = URL("https://www.youtube.com/results?search_query=$query")
+        val conn = url.openConnection() as HttpURLConnection
+        conn.connectTimeout = 10000
+        conn.readTimeout = 10000
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36")
+        conn.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        val html = conn.inputStream.bufferedReader(Charsets.UTF_8).use { reader ->
+            val sb = StringBuilder()
+            val buf = CharArray(8192)
+            while (true) {
+                val n = reader.read(buf)
+                if (n <= 0) break
+                sb.append(buf, 0, n)
+                if (sb.length > 2_000_000) break
+            }
+            sb.toString()
+        }
+        conn.disconnect()
+        val jsonText = extractYouTubeInitialData(html) ?: return emptyList()
+        val root = JSONObject(jsonText)
+        val renderers = mutableListOf<JSONObject>()
+        collectYouTubeVideoRenderers(root, renderers)
+        val items = mutableListOf<TaskStore.ResearchItem>()
+        for (renderer in renderers) {
+            val videoId = renderer.optString("videoId", "").trim()
+            if (videoId.isBlank()) continue
+            val title = youtubeRunsText(renderer.optJSONObject("title")).ifBlank { "YouTube 公开视频" }
+            val author = youtubeRunsText(renderer.optJSONObject("ownerText"))
+            val viewText = renderer.optJSONObject("viewCountText")?.optString("simpleText", "") ?: ""
+            val published = renderer.optJSONObject("publishedTimeText")?.optString("simpleText", "") ?: ""
+            val length = renderer.optJSONObject("lengthText")?.optString("simpleText", "") ?: ""
+            val combined = listOf(title, author, viewText, published, length).joinToString(" ")
+            val metric = parseResearchMetric(combined, info)
+            val time = parseResearchTime(combined, info)
+            val score = researchScore(metric.first, time.first, inputs.sortPreference)
+            val link = "https://www.youtube.com/watch?v=$videoId"
+            items.add(
+                TaskStore.ResearchItem(
+                    platform = info.label,
+                    topic = inputs.topic,
+                    title = title.take(90),
+                    author = author,
+                    metricsText = metric.second.ifBlank { viewText },
+                    metricScore = metric.first,
+                    timeText = time.second.ifBlank { published },
+                    newnessScore = time.first,
+                    score = score.first,
+                    scoreReason = score.second,
+                    contentType = "视频",
+                    link = link,
+                    status = "公开网页已识别链接",
+                    dedupeKey = "${info.label}|$link",
+                    capturedAt = System.currentTimeMillis()
+                )
+            )
+            if (items.size >= inputs.limit) break
+        }
+        return items
+    }
+
+    private fun extractYouTubeInitialData(html: String): String? {
+        val markers = listOf("var ytInitialData = ", "ytInitialData = ", "\"ytInitialData\":")
+        for (marker in markers) {
+            val start = html.indexOf(marker)
+            if (start < 0) continue
+            val jsonStart = html.indexOf('{', start)
+            if (jsonStart < 0) continue
+            var depth = 0
+            var inString = false
+            var escaped = false
+            for (i in jsonStart until html.length) {
+                val ch = html[i]
+                if (escaped) {
+                    escaped = false
+                    continue
+                }
+                if (ch == '\\') {
+                    escaped = true
+                    continue
+                }
+                if (ch == '"') inString = !inString
+                if (!inString) {
+                    if (ch == '{') depth++
+                    if (ch == '}') {
+                        depth--
+                        if (depth == 0) return html.substring(jsonStart, i + 1)
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun collectYouTubeVideoRenderers(value: Any?, out: MutableList<JSONObject>) {
+        when (value) {
+            is JSONObject -> {
+                value.optJSONObject("videoRenderer")?.let { out.add(it) }
+                val keys = value.keys()
+                while (keys.hasNext()) {
+                    collectYouTubeVideoRenderers(value.opt(keys.next()), out)
+                }
+            }
+            is JSONArray -> {
+                for (i in 0 until value.length()) collectYouTubeVideoRenderers(value.opt(i), out)
+            }
+        }
+    }
+
+    private fun youtubeRunsText(obj: JSONObject?): String {
+        if (obj == null) return ""
+        obj.optString("simpleText", "").takeIf { it.isNotBlank() }?.let { return it }
+        val runs = obj.optJSONArray("runs") ?: return ""
+        val sb = StringBuilder()
+        for (i in 0 until runs.length()) {
+            sb.append(runs.optJSONObject(i)?.optString("text", "") ?: "")
+        }
+        return sb.toString().trim()
+    }
+
+    private fun collectResearchTextEntries(root: AccessibilityNodeInfo): List<ResearchTextEntry> {
+        val dm = resources.displayMetrics
+        val out = mutableListOf<ResearchTextEntry>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var visited = 0
+        while (queue.isNotEmpty() && visited < 700) {
+            val node = queue.removeFirst()
+            visited++
+            val raw = listOf(
+                node.text?.toString() ?: "",
+                node.contentDescription?.toString() ?: "",
+                node.hintText?.toString() ?: ""
+            ).joinToString(" ")
+            val text = normalizedText(raw)
+            val b = nodeBounds(node)
+            if (text.length >= 2 && b.width() > 0 && b.height() > 0 &&
+                b.centerX() in 0..dm.widthPixels && b.centerY() in 0..dm.heightPixels
+            ) {
+                out.add(ResearchTextEntry(Rect(b), text.take(180)))
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { queue.add(it) }
+        }
+        return out.distinctBy { "${it.bounds.flattenToString()}|${it.text}" }
+    }
+
+    private fun collectResearchCardRoots(root: AccessibilityNodeInfo): List<Rect> {
+        val dm = resources.displayMetrics
+        val boundsList = mutableListOf<Rect>()
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var visited = 0
+        while (queue.isNotEmpty() && visited < 700) {
+            val node = queue.removeFirst()
+            visited++
+            if (node.isClickable) {
+                val b = nodeBounds(node)
+                val maxHeight = (dm.heightPixels * 0.62f).toInt()
+                if (b.width() > dm.widthPixels * 0.30 && b.height() in 70..maxHeight &&
+                    b.top >= 0 && b.bottom <= dm.heightPixels + 40
+                ) {
+                    boundsList.add(Rect(b))
+                }
+            }
+            for (i in 0 until node.childCount) node.getChild(i)?.let { queue.add(it) }
+        }
+        val kept = mutableListOf<Rect>()
+        for (b in boundsList.distinctBy { it.flattenToString() }.sortedByDescending { it.width() * it.height() }) {
+            val overlapped = kept.any { old ->
+                val inter = Rect()
+                inter.setIntersect(old, b)
+                val interArea = inter.width().coerceAtLeast(0) * inter.height().coerceAtLeast(0)
+                val minArea = minOf(old.width() * old.height(), b.width() * b.height()).coerceAtLeast(1)
+                interArea.toFloat() / minArea > 0.65f
+            }
+            if (!overlapped) kept.add(b)
+        }
+        return kept.sortedWith(compareBy<Rect> { it.top }.thenBy { it.left })
+    }
+
+    private fun extractResearchCards(root: AccessibilityNodeInfo): List<ResearchCard> {
+        val entries = collectResearchTextEntries(root)
+        val cards = mutableListOf<ResearchCard>()
+        for (bounds in collectResearchCardRoots(root)) {
+            val texts = entries.filter { e ->
+                e.bounds.centerX() in (bounds.left - 12)..(bounds.right + 12) &&
+                    e.bounds.centerY() in (bounds.top - 12)..(bounds.bottom + 12)
+            }.map { it.text }.distinct()
+            val combined = texts.joinToString(" ")
+            if (texts.size >= 2 || combined.length >= 10) cards.add(ResearchCard(Rect(bounds), texts))
+        }
+        if (cards.size >= 2) return cards.distinctBy { it.texts.joinToString("|").take(180) }
+        val sorted = entries.sortedWith(compareBy<ResearchTextEntry> { it.bounds.top }.thenBy { it.bounds.left })
+        var i = 0
+        while (i < sorted.size) {
+            val startTop = sorted[i].bounds.top
+            val band = mutableListOf<ResearchTextEntry>()
+            var j = i
+            while (j < sorted.size && sorted[j].bounds.top - startTop <= 300) {
+                band.add(sorted[j])
+                j++
+            }
+            val texts = band.map { it.text }.distinct()
+            val combined = texts.joinToString(" ")
+            if (combined.length >= 10) {
+                val left = band.minOf { it.bounds.left }
+                val top = band.minOf { it.bounds.top }
+                val right = band.maxOf { it.bounds.right }
+                val bottom = band.maxOf { it.bounds.bottom }
+                cards.add(ResearchCard(Rect(left, top, right, bottom), texts))
+            }
+            i = if (j == i) i + 1 else j
+        }
+        return cards.distinctBy { it.texts.joinToString("|").take(180) }
+    }
+
+    private fun researchItemFromCard(
+        info: PlatformRegistry.PlatformInfo,
+        inputs: TaskStore.ResearchInputs,
+        card: ResearchCard
+    ): TaskStore.ResearchItem? {
+        val texts = card.texts.map { normalizedText(it) }.filter { it.isNotBlank() }.distinct()
+        val combined = texts.joinToString(" ")
+        if (combined.length < 6 || isResearchChrome(combined, inputs.topic)) return null
+        val metric = parseResearchMetric(combined, info)
+        val time = parseResearchTime(combined, info)
+        val contentType = classifyResearchContentType(combined, info)
+        if (inputs.contentType == "视频" && contentType == "图文") return null
+        if (inputs.contentType == "图文" && contentType == "视频") return null
+        val title = chooseResearchTitle(texts, inputs.topic)
+        if (title.isBlank()) return null
+        val author = extractResearchAuthor(texts, combined, title)
+        val link = LinkResolver.extractResearchLink(info.label, combined)
+        val score = researchScore(metric.first, time.first, inputs.sortPreference)
+        val dedupeKey = if (!link.isNullOrBlank()) {
+            "${info.label}|$link"
+        } else {
+            "${info.label}|${normalizedKeyPart(title)}|${normalizedKeyPart(author)}|${metric.first / 1000}"
+        }
+        return TaskStore.ResearchItem(
+            platform = info.label,
+            topic = inputs.topic,
+            title = title,
+            author = author,
+            metricsText = metric.second,
+            metricScore = metric.first,
+            timeText = time.second,
+            newnessScore = time.first,
+            score = score.first,
+            scoreReason = score.second,
+            contentType = contentType,
+            link = link ?: "",
+            status = if (link.isNullOrBlank()) "待补链接" else "已识别链接",
+            dedupeKey = dedupeKey,
+            capturedAt = System.currentTimeMillis()
+        )
+    }
+
+    private fun isResearchChrome(text: String, topic: String): Boolean {
+        val clean = normalizedText(text)
+        if (clean.length < 6) return true
+        val chrome = listOf("综合", "视频", "用户", "全部", "相关", "作品", "搜索结果", "Search", "Home", "Shorts", "Subscriptions")
+        val withoutChrome = chrome.fold(clean) { acc, word -> acc.replace(word, "") }.trim()
+        return withoutChrome.length < 4 || (topic.isNotBlank() && withoutChrome == topic)
+    }
+
+    private fun parseResearchMetric(text: String, info: PlatformRegistry.PlatformInfo): Pair<Long, String> {
+        val labels = (info.metricHints + listOf("点赞", "赞", "喜欢", "评论", "分享", "收藏", "播放", "观看", "阅读", "转发", "弹幕", "投币", "likes", "like", "comments", "shares", "views", "view")).distinct()
+        val labelPattern = labels.joinToString("|") { Regex.escape(it) }
+        val regex = Regex("(?i)($labelPattern)?\\s*[:：]?\\s*(\\d+(?:\\.\\d+)?)(万|亿|k|w|m)?")
+        var score = 0L
+        val tokens = mutableListOf<String>()
+        for (m in regex.findAll(text)) {
+            val label = m.groupValues.getOrNull(1)?.trim().orEmpty()
+            val suffix = m.groupValues.getOrNull(3)?.trim().orEmpty()
+            if (label.isBlank() && suffix.isBlank()) continue
+            val value = m.groupValues.getOrNull(2)?.toDoubleOrNull() ?: continue
+            val multiplier = when (suffix.lowercase()) {
+                "万" -> 10000.0
+                "亿" -> 100000000.0
+                "k", "w" -> 1000.0
+                "m" -> 1000000.0
+                else -> 1.0
+            }
+            val weight = when {
+                label.contains("评论") || label.contains("comment", ignoreCase = true) -> 3.0
+                label.contains("分享") || label.contains("share", ignoreCase = true) || label.contains("转发") -> 4.0
+                label.contains("收藏") -> 2.0
+                label.contains("播放") || label.contains("观看") || label.contains("view", ignoreCase = true) -> 0.2
+                else -> 1.0
+            }
+            score += (value * multiplier * weight).toLong()
+            tokens.add(m.value.trim())
+            if (tokens.size >= 5) break
+        }
+        return score to tokens.distinct().joinToString(" · ")
+    }
+
+    private fun parseResearchTime(text: String, info: PlatformRegistry.PlatformInfo): Pair<Int, String> {
+        val patterns: List<Pair<Regex, (MatchResult) -> Int>> = listOf(
+            Regex("刚刚|just now", RegexOption.IGNORE_CASE) to { 100 },
+            Regex("(\\d+)\\s*分钟前|(\\d+)\\s*minutes? ago", RegexOption.IGNORE_CASE) to { m ->
+                val n = (m.groupValues.getOrNull(1)?.toIntOrNull() ?: m.groupValues.getOrNull(2)?.toIntOrNull() ?: 0)
+                (100 - n / 10).coerceIn(55, 100)
+            },
+            Regex("(\\d+)\\s*小时前|(\\d+)\\s*hours? ago", RegexOption.IGNORE_CASE) to { m ->
+                val n = (m.groupValues.getOrNull(1)?.toIntOrNull() ?: m.groupValues.getOrNull(2)?.toIntOrNull() ?: 0)
+                (90 - n * 2).coerceIn(35, 90)
+            },
+            Regex("今天|today", RegexOption.IGNORE_CASE) to { 75 },
+            Regex("昨天|yesterday", RegexOption.IGNORE_CASE) to { 60 },
+            Regex("前天") to { 45 },
+            Regex("(\\d+)\\s*天前|(\\d+)\\s*days? ago", RegexOption.IGNORE_CASE) to { m ->
+                val n = (m.groupValues.getOrNull(1)?.toIntOrNull() ?: m.groupValues.getOrNull(2)?.toIntOrNull() ?: 0)
+                (70 - n * 5).coerceIn(10, 70)
+            },
+            Regex("\\d{4}[-/]\\d{1,2}[-/]\\d{1,2}|\\d{1,2}月\\d{1,2}日") to { 30 }
+        )
+        for ((regex, scorer) in patterns) {
+            val match = regex.find(text) ?: continue
+            return scorer(match) to match.value.trim()
+        }
+        val hint = info.timeHints.firstOrNull { text.contains(it, ignoreCase = true) }
+        return if (hint != null) 35 to hint else 10 to ""
+    }
+
+    private fun classifyResearchContentType(text: String, info: PlatformRegistry.PlatformInfo): String {
+        val hasDuration = Regex("\\d{1,2}:\\d{2}").containsMatchIn(text)
+        return when {
+            listOf("图文", "图片", "笔记", "相册", "photo").any { text.contains(it, ignoreCase = true) } -> "图文"
+            hasDuration || listOf("视频", "播放", "观看", "views", "view").any { text.contains(it, ignoreCase = true) } -> "视频"
+            info.label == "小红书" -> "图文"
+            info.label in listOf("抖音", "快手", "B站", "YouTube", "TikTok") -> "视频"
+            else -> "未知"
+        }
+    }
+
+    private fun chooseResearchTitle(texts: List<String>, topic: String): String {
+        val chrome = listOf("综合", "视频", "用户", "全部", "相关", "作品", "搜索", "关注", "点赞", "评论", "分享", "收藏", "播放", "Search", "Home", "Shorts", "Subscriptions")
+        val candidates = texts.map { normalizedText(it) }.filter { text ->
+            text.length >= 4 &&
+                !Regex("^[\\d.]+(万|亿|k|w|m)?$", RegexOption.IGNORE_CASE).matches(text) &&
+                !Regex("^(刚刚|今天|昨天|前天|\\d+\\s*(分钟前|小时前|天前))$").matches(text) &&
+                chrome.none { it == text } &&
+                !(topic.isNotBlank() && text == topic)
+        }
+        return candidates.maxByOrNull { it.length }?.take(90) ?: ""
+    }
+
+    private fun extractResearchAuthor(texts: List<String>, combined: String, title: String): String {
+        Regex("@([^\\s·|]{2,30})").find(combined)?.groupValues?.getOrNull(1)?.let { return it.trim() }
+        val titleIndex = texts.indexOfFirst { normalizedText(it) == title }
+        val start = if (titleIndex >= 0) titleIndex + 1 else 0
+        for (i in start until texts.size) {
+            val text = normalizedText(texts[i])
+            if (text.length in 2..24 && text != title &&
+                !Regex("^[\\d.]+(万|亿|k|w|m)?$", RegexOption.IGNORE_CASE).matches(text) &&
+                !listOf("分钟前", "小时前", "昨天", "今天", "点赞", "评论", "分享", "收藏", "播放", "views", "likes").any { text.contains(it, ignoreCase = true) }
+            ) {
+                return text.removePrefix("@")
+            }
+        }
+        return ""
+    }
+
+    private fun researchScore(metricScore: Long, newnessScore: Int, sortPreference: String): Pair<Double, String> {
+        val traffic = if (metricScore <= 0) 0.0 else (kotlin.math.ln(metricScore.toDouble() + 1.0) / kotlin.math.ln(10.0) * 20.0).coerceIn(0.0, 100.0)
+        val score = when (sortPreference) {
+            "高流量优先" -> traffic * 0.8 + newnessScore * 0.2
+            "新发优先" -> newnessScore * 0.8 + traffic * 0.2
+            else -> traffic * 0.55 + newnessScore * 0.45
+        }
+        val reason = when (sortPreference) {
+            "高流量优先" -> "高流量 $metricScore · 新发 $newnessScore"
+            "新发优先" -> "新发 $newnessScore · 高流量 $metricScore"
+            else -> "综合 高流量 $metricScore · 新发 $newnessScore"
+        }
+        return score to reason
+    }
+
+    private fun normalizedKeyPart(text: String): String {
+        return text.lowercase().replace(Regex("[^a-z0-9\\u4e00-\\u9fa5]"), "").take(40)
     }
 
     private fun currentPageTargetKey(platform: String, snapshot: WindowSnapshot): String {
@@ -2309,11 +3229,11 @@ class AutomationService : AccessibilityService() {
         ))
         panel.addView(row(
             btn("平台：${platformForIntervention()}") {
-                val platforms = listOf("抖音", "快手", "小红书", "哔哩哔哩", "微博")
-                val current = platformForIntervention()
+                val platforms = PlatformRegistry.labels
+                val current = PlatformRegistry.canonicalLabel(platformForIntervention())
                 overlayPlatform = platforms[(platforms.indexOf(current).coerceAtLeast(0) + 1) % platforms.size]
                 updateInterventionPanel()
-                Toast.makeText(this, "校准平台已切到$overlayPlatform", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "校准平台已切到$overlayPlatform（${PlatformRegistry.routeSummary(overlayPlatform)}）", Toast.LENGTH_SHORT).show()
             },
             btn("同步识别") {
                 startSyncRecognitionInternal(platformForIntervention())

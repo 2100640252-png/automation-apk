@@ -12,8 +12,8 @@ android {
         applicationId = "com.automation.work"
         minSdk = 26
         targetSdk = 34
-        versionCode = 31
-        versionName = "4.4.0"
+        versionCode = 32
+        versionName = "4.5.0"
     }
 
     // 固定签名：用同一把签名钥匙签每一个 Release 包。
