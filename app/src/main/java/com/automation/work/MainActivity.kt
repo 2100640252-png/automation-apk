@@ -70,9 +70,9 @@ class MainActivity : ComponentActivity() {
 
     fun currentVersionName(): String {
         return try {
-            packageManager.getPackageInfo(packageName, 0).versionName ?: "4.3.0"
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "4.4.0"
         } catch (_: Exception) {
-            "4.3.0"
+            "4.4.0"
         }
     }
 
@@ -161,6 +161,42 @@ class MainActivity : ComponentActivity() {
         refreshState()
     }
 
+    fun startSearchAssist(platform: String, topic: String, quantity: Int) {
+        if (topic.isBlank()) {
+            taskStatus = "搜索辅助失败：先填写话题。"
+            refreshState()
+            return
+        }
+        val gate = AutomationService.gateFailureReason()
+        if (gate != null) {
+            taskStatus = gate
+            TaskStore.appendLog(this, gate)
+            refreshState()
+            return
+        }
+        AutomationService.startSearchAssist(this, platform, topic, quantity)
+        taskStatus = "搜索辅助已开始：打开 $platform 搜索“${topic.trim()}”，停在结果页；数量只作候选确认上限，不自动评论。"
+        refreshState()
+    }
+
+    fun startCommentCurrentPage(platform: String, comment: String) {
+        if (comment.isBlank()) {
+            taskStatus = "评论这一条失败：先填写评论内容。"
+            refreshState()
+            return
+        }
+        val gate = AutomationService.gateFailureReason()
+        if (gate != null) {
+            taskStatus = gate
+            TaskStore.appendLog(this, gate)
+            refreshState()
+            return
+        }
+        AutomationService.startCommentCurrentPage(this, platform, comment)
+        taskStatus = "已确认评论当前这一条：只评论这一条，成功后记录防重复；下一条需手动选择后再次确认。"
+        refreshState()
+    }
+
     fun startDirectOpenTest(link: String) {
         val cleanLink = link.trim()
         if (cleanLink.isBlank()) {
@@ -212,12 +248,60 @@ class MainActivity : ComponentActivity() {
             refreshState()
             return
         }
-        AutomationService.startCalibration(this, platform, kind)
-        taskStatus = if (kind == PointStore.KIND_SEND) {
-            "校准发送点：先切到$platform 视频页并打开评论键盘，让发送键可见，再把十字圆心对准发送键保存。"
+        val role = PointStore.kindToRole(kind)
+        AutomationService.startCalibration(this, platform, role)
+        taskStatus = if (role == PointStore.ROLE_SEND) {
+            "重新校准发送键：先切到$platform 视频页并打开评论键盘，让发送键可见，再把十字圆心对准发送键保存；保存后还要测试点位点击。"
         } else {
-            "校准评论点：切到$platform 视频页，把十字圆心对准评论入口保存。"
+            "重新校准${PointStore.roleDisplayName(role)}：切到$platform 目标页面，把十字圆心对准目标保存；保存后还要测试点位点击。"
         }
+        pointRefresh++
+        refreshState()
+    }
+
+    fun startSyncRecognition(platform: String) {
+        if (AutomationService.instance == null) {
+            taskStatus = AutomationService.gateFailureReason() ?: "无障碍服务未连接。"
+            PermissionHelper.openAccessibilitySettings(this)
+            refreshState()
+            return
+        }
+        AutomationService.startSyncRecognition(this, platform)
+        taskStatus = "同步识别已开始：切到$platform 目标页面，工具记录点击前窗口；你点目标按钮后，它会反馈候选角色，确认命名后才保存。"
+        pointRefresh++
+        refreshState()
+    }
+
+    fun testSemanticPoint(platform: String, role: String) {
+        if (AutomationService.instance == null) {
+            taskStatus = AutomationService.gateFailureReason() ?: "无障碍服务未连接。"
+            PermissionHelper.openAccessibilitySettings(this)
+            refreshState()
+            return
+        }
+        AutomationService.testSemanticPoint(this, platform, role)
+        taskStatus = "点位真实点击验证进行中：$platform ${PointStore.roleDisplayName(role)}；手势完成且转换验证通过才算真实点击。"
+        pointRefresh++
+        refreshState()
+    }
+
+    fun deleteSemanticPoint(platform: String, role: String) {
+        PointStore.deleteSemantic(this, platform, role)
+        taskStatus = "语义点位已删除：$platform ${PointStore.roleDisplayName(role)}"
+        pointRefresh++
+        refreshState()
+    }
+
+    fun startPointLoop(platform: String, roles: List<String>, rounds: Int, intervalSeconds: Int) {
+        val gate = AutomationService.gateFailureReason()
+        if (gate != null) {
+            taskStatus = gate
+            TaskStore.appendLog(this, gate)
+            refreshState()
+            return
+        }
+        AutomationService.startPointLoop(this, platform, roles, rounds, intervalSeconds)
+        taskStatus = "点位循环已开始：只循环导航/测试语义点位，SEND 已排除；任一步转换验证失败就停止。"
         pointRefresh++
         refreshState()
     }
@@ -230,7 +314,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         AutomationService.startPointPreview(this, platform)
-        taskStatus = "点位预览已打开：切到$platform 页面，绿圈是评论点、红圈是发送点，拖动可改。"
+        taskStatus = "语义点位预览已打开：切到$platform 页面查看各角色位置，拖动改坐标后必须测试点位点击。"
         pointRefresh++
         refreshState()
     }
@@ -282,6 +366,7 @@ private fun GateChips(activity: MainActivity) {
 fun AutomationApp(activity: MainActivity) {
     val savedComment = remember { TaskStore.loadCommentInputs(activity) }
     val savedVideo = remember { TaskStore.loadVideoInputs(activity) }
+    val savedSearch = remember { TaskStore.loadSearchInputs(activity) }
     var selectedTab by remember { mutableStateOf(0) }
     var commentLink by remember { mutableStateOf(savedComment.first.firstOrNull() ?: "") }
     var commentText by remember { mutableStateOf(savedComment.second) }
@@ -289,19 +374,27 @@ fun AutomationApp(activity: MainActivity) {
     var videoCaption by remember { mutableStateOf(savedVideo.caption) }
     var videoMaterial by remember { mutableStateOf(savedVideo.material) }
     var videoSchedule by remember { mutableStateOf(savedVideo.schedule) }
-    var platform by remember { mutableStateOf("抖音") }
+    var platform by remember { mutableStateOf(savedSearch.platform) }
+    var searchTopic by remember { mutableStateOf(savedSearch.topic) }
+    var searchQuantity by remember { mutableStateOf(savedSearch.quantity.toString()) }
     val tabs = listOf("评论", "视频", "点位", "日志")
     val platforms = listOf("抖音", "快手", "小红书", "哔哩哔哩", "微博")
     val gatePassed = activity.gateReason.startsWith("已通过")
-    val commentPoint = remember(platform, activity.pointRefresh, activity.logText) {
-        PointStore.describe(activity, platform, PointStore.KIND_COMMENT)
+    val semanticPoints = remember(platform, activity.pointRefresh, activity.logText) {
+        PointStore.listSemantic(activity, platform).associateBy { it.role }
     }
-    val sendPoint = remember(platform, activity.pointRefresh, activity.logText) {
-        PointStore.describe(activity, platform, PointStore.KIND_SEND)
-    }
+    val savedLoop = remember(platform, activity.pointRefresh) { PointStore.loadLoop(activity, platform) }
+    var loopRoles by remember(platform) { mutableStateOf(savedLoop.roles.toSet()) }
+    var loopRounds by remember(platform) { mutableStateOf(savedLoop.rounds.toString()) }
+    var loopInterval by remember(platform) { mutableStateOf(savedLoop.intervalSeconds.toString()) }
 
     fun saveVideo(link: String, caption: String, material: String, schedule: String) {
         TaskStore.saveVideoInputs(activity, TaskStore.VideoInputs(link, caption, material, schedule))
+    }
+
+    fun saveSearch(platform: String, topic: String, quantityText: String) {
+        val quantity = quantityText.toIntOrNull()?.coerceIn(1, 100) ?: 10
+        TaskStore.saveSearchInputs(activity, TaskStore.SearchInputs(platform, topic, quantity))
     }
 
     Scaffold(
@@ -363,6 +456,57 @@ fun AutomationApp(activity: MainActivity) {
                             }
                             Text(activity.targetEchoText)
                             Text("检测按钮坐标：X=${activity.targetX} Y=${activity.targetY}")
+                        }
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    Card(Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text("话题搜索辅助", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                            Text("只打开搜索并停在结果页；数量是本轮可确认的不同候选上限，不自动评论下一条。已验证评论的视频会记录防重复。")
+                            Spacer(Modifier.height(8.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    onClick = {
+                                        val next = (platforms.indexOf(platform).coerceAtLeast(0) + 1) % platforms.size
+                                        platform = platforms[next]
+                                        saveSearch(platform, searchTopic, searchQuantity)
+                                        activity.pointRefresh++
+                                    },
+                                    modifier = Modifier.weight(1f)
+                                ) { Text("平台：$platform") }
+                                OutlinedTextField(
+                                    value = searchQuantity,
+                                    onValueChange = {
+                                        searchQuantity = it.filter { ch -> ch.isDigit() }.take(3)
+                                        saveSearch(platform, searchTopic, searchQuantity)
+                                    },
+                                    label = { Text("候选上限") },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            OutlinedTextField(
+                                value = searchTopic,
+                                onValueChange = {
+                                    searchTopic = it
+                                    saveSearch(platform, it, searchQuantity)
+                                },
+                                label = { Text("搜索话题") },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            Spacer(Modifier.height(10.dp))
+                            Button(
+                                onClick = { activity.startSearchAssist(platform, searchTopic, searchQuantity.toIntOrNull() ?: 10) },
+                                enabled = gatePassed && searchTopic.isNotBlank(),
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text("打开搜索并停在结果页") }
+                            Spacer(Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = { activity.startCommentCurrentPage(platform, commentText) },
+                                enabled = gatePassed && commentText.isNotBlank(),
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text("评论这一条") }
+                            Text("流程：搜索停在结果页后，你手动点开一条视频，再点“评论这一条”确认；成功后记录防重复，下一条仍需手动确认。已记录防重复 ${TaskStore.commentedTargetCount(activity)} 条。")
                         }
                     }
                     Spacer(Modifier.height(14.dp))
@@ -481,20 +625,22 @@ fun AutomationApp(activity: MainActivity) {
                 2 -> {
                     Card(Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(16.dp)) {
-                            Text("点位", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                            Text("语义点位", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                             Spacer(Modifier.height(8.dp))
                             GateChips(activity)
                             Spacer(Modifier.height(8.dp))
                             Text("当前平台：$platform")
-                            Text("发送点要在键盘打开、发送键可见时校准；键盘没打开时校准的位置会偏。")
+                            Text("点位保存角色、命名、节点签名和前后窗口证据。保存坐标不等于真实点击，必须点“测试点位点击”看到转换验证通过。")
                             Spacer(Modifier.height(10.dp))
-                            Button(onClick = { activity.showPointPreview(platform) }, modifier = Modifier.fillMaxWidth()) { Text("预览点位") }
+                            Button(onClick = { activity.startSyncRecognition(platform) }, modifier = Modifier.fillMaxWidth()) { Text("同步识别") }
                             Spacer(Modifier.height(8.dp))
                             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(onClick = { activity.showPointPreview(platform) }, modifier = Modifier.weight(1f)) { Text("预览点位") }
                                 OutlinedButton(
                                     onClick = {
                                         val next = (platforms.indexOf(platform).coerceAtLeast(0) + 1) % platforms.size
                                         platform = platforms[next]
+                                        saveSearch(platform, searchTopic, searchQuantity)
                                         activity.pointRefresh++
                                     },
                                     modifier = Modifier.weight(1f)
@@ -504,28 +650,81 @@ fun AutomationApp(activity: MainActivity) {
                         }
                     }
                     Spacer(Modifier.height(14.dp))
-                    Card(Modifier.fillMaxWidth()) {
-                        Column(Modifier.padding(16.dp)) {
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text("评论点", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                                StatusChip(if (commentPoint == "未配置") "未配置" else "已配置", commentPoint != "未配置")
+                    PointStore.roles.forEach { role ->
+                        val point = semanticPoints[role]
+                        Card(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(16.dp)) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text(PointStore.roleDisplayName(role), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                                    StatusChip(if (point == null) "未配置" else "已配置", point != null)
+                                }
+                                Text(PointStore.describeSemantic(point))
+                                if (role == PointStore.ROLE_SEND) Text("发送键要在键盘打开、发送键可见时校准；键盘没打开时校准的位置会偏。")
+                                Spacer(Modifier.height(8.dp))
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedButton(
+                                        onClick = { activity.testSemanticPoint(platform, role) },
+                                        enabled = point != null,
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("测试点位点击") }
+                                    OutlinedButton(
+                                        onClick = { activity.startCalibration(platform, role) },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("重新校准") }
+                                    OutlinedButton(
+                                        onClick = { activity.deleteSemanticPoint(platform, role) },
+                                        enabled = point != null,
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("删除") }
+                                }
                             }
-                            Text("坐标：$commentPoint")
-                            Spacer(Modifier.height(8.dp))
-                            OutlinedButton(onClick = { activity.startCalibration(platform, PointStore.KIND_COMMENT) }, modifier = Modifier.fillMaxWidth()) { Text("校准评论点") }
                         }
+                        Spacer(Modifier.height(12.dp))
                     }
-                    Spacer(Modifier.height(12.dp))
                     Card(Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(16.dp)) {
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Text("发送点", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                                StatusChip(if (sendPoint == "未配置") "未配置" else "已配置", sendPoint != "未配置")
-                            }
-                            Text("坐标：$sendPoint")
-                            Text("校准前先打开评论键盘，让发送键可见。")
+                            Text("点位循环", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                            Text("只循环导航/测试语义点位，SEND 已排除；任一步转换验证失败就停止。")
                             Spacer(Modifier.height(8.dp))
-                            OutlinedButton(onClick = { activity.startCalibration(platform, PointStore.KIND_SEND) }, modifier = Modifier.fillMaxWidth()) { Text("校准发送点") }
+                            PointStore.roles.filter { it != PointStore.ROLE_SEND }.forEach { role ->
+                                val selected = role in loopRoles
+                                OutlinedButton(
+                                    onClick = {
+                                        loopRoles = if (selected) loopRoles - role else loopRoles + role
+                                        PointStore.saveLoop(activity, platform, loopRoles.toList(), loopRounds.toIntOrNull() ?: 1, loopInterval.toIntOrNull() ?: 2)
+                                    },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) { Text(if (selected) "✓ ${PointStore.roleDisplayName(role)}" else PointStore.roleDisplayName(role)) }
+                                Spacer(Modifier.height(6.dp))
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedTextField(
+                                    value = loopRounds,
+                                    onValueChange = {
+                                        loopRounds = it.filter { ch -> ch.isDigit() }.take(2)
+                                        PointStore.saveLoop(activity, platform, loopRoles.toList(), loopRounds.toIntOrNull() ?: 1, loopInterval.toIntOrNull() ?: 2)
+                                    },
+                                    label = { Text("轮数 1-20") },
+                                    modifier = Modifier.weight(1f)
+                                )
+                                OutlinedTextField(
+                                    value = loopInterval,
+                                    onValueChange = {
+                                        loopInterval = it.filter { ch -> ch.isDigit() }.take(2)
+                                        PointStore.saveLoop(activity, platform, loopRoles.toList(), loopRounds.toIntOrNull() ?: 1, loopInterval.toIntOrNull() ?: 2)
+                                    },
+                                    label = { Text("间隔秒") },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
+                            Spacer(Modifier.height(10.dp))
+                            Button(
+                                onClick = { activity.startPointLoop(platform, loopRoles.toList(), loopRounds.toIntOrNull() ?: 1, loopInterval.toIntOrNull() ?: 2) },
+                                enabled = gatePassed && loopRoles.isNotEmpty(),
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text("开始点位循环") }
+                            Spacer(Modifier.height(8.dp))
+                            OutlinedButton(onClick = { activity.stopTask() }, modifier = Modifier.fillMaxWidth()) { Text("停止点位循环") }
                         }
                     }
                 }

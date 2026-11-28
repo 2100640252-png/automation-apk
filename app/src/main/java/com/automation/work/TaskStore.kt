@@ -17,6 +17,14 @@ object TaskStore {
     private const val KEY_ERROR_REPORTS = "error_reports"
     private const val KEY_COMMENT_INPUTS = "comment_inputs_json"
     private const val KEY_VIDEO_INPUTS = "video_inputs_json"
+    private const val KEY_SEARCH_INPUTS = "search_inputs_json"
+    private const val KEY_COMMENTED_TARGETS = "commented_target_keys_json"
+
+    data class SearchInputs(
+        val platform: String = "抖音",
+        val topic: String = "",
+        val quantity: Int = 10
+    )
 
     data class VideoInputs(
         val link: String = "",
@@ -131,6 +139,66 @@ object TaskStore {
         }
         return Triple(emptyList(), "", "10")
     }
+
+    fun saveSearchInputs(context: Context, inputs: SearchInputs) {
+        val o = JSONObject()
+        o.put("platform", inputs.platform)
+        o.put("topic", inputs.topic)
+        o.put("quantity", inputs.quantity.coerceIn(1, 100))
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_SEARCH_INPUTS, o.toString()).apply()
+    }
+
+    fun loadSearchInputs(context: Context): SearchInputs {
+        val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_SEARCH_INPUTS, null) ?: return SearchInputs()
+        return try {
+            val o = JSONObject(raw)
+            SearchInputs(
+                platform = o.optString("platform", "抖音"),
+                topic = o.optString("topic", ""),
+                quantity = o.optInt("quantity", 10).coerceIn(1, 100)
+            )
+        } catch (_: Exception) {
+            SearchInputs()
+        }
+    }
+
+    fun commentedTargetKeys(context: Context): Set<String> {
+        val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_COMMENTED_TARGETS, null) ?: return emptySet()
+        return try {
+            val arr = JSONArray(raw)
+            val out = linkedSetOf<String>()
+            for (i in 0 until arr.length()) {
+                val key = arr.optString(i).trim()
+                if (key.isNotBlank()) out.add(key)
+            }
+            out
+        } catch (_: Exception) {
+            emptySet()
+        }
+    }
+
+    fun hasCommentedTarget(context: Context, targetKey: String): Boolean {
+        if (targetKey.isBlank()) return false
+        return targetKey in commentedTargetKeys(context)
+    }
+
+    fun recordCommentedTarget(context: Context, targetKey: String): Boolean {
+        val key = targetKey.trim()
+        if (key.isBlank()) return false
+        val keys = commentedTargetKeys(context).toMutableSet()
+        val added = keys.add(key)
+        val arr = JSONArray()
+        keys.take(1000).forEach { arr.put(it) }
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_COMMENTED_TARGETS, arr.toString())
+            .apply()
+        return added
+    }
+
+    fun commentedTargetCount(context: Context): Int = commentedTargetKeys(context).size
 
     fun saveVideoInputs(context: Context, inputs: VideoInputs) {
         val o = JSONObject()

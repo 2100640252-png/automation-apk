@@ -28,7 +28,8 @@ object LinkResolver {
         val platform: String,
         val packageName: String?,
         val method: String,
-        val reason: String
+        val reason: String,
+        val targetKey: String = ""
     )
 
     private data class TargetInfo(
@@ -199,7 +200,8 @@ object LinkResolver {
         uri: Uri,
         targetPackage: String,
         method: String,
-        platform: String
+        platform: String,
+        targetKey: String = ""
     ): OpenResult? {
         val pm = context.packageManager
         val intent = Intent(Intent.ACTION_VIEW, uri).apply {
@@ -216,17 +218,17 @@ object LinkResolver {
             val actual = resolved.flattenToString()
             val reason = "步骤3 直达成功：VIEW intent 已发出，方式=$method，目标包名=$targetPackage，实际接管=$actual，目标URI=$uri"
             TaskStore.appendLog(context, reason)
-            OpenResult(true, platform, targetPackage, method, reason)
+            OpenResult(true, platform, targetPackage, method, reason, targetKey)
         } catch (e: Exception) {
             TaskStore.appendLog(context, "步骤3 尝试直达：$method 出错 ${e.javaClass.simpleName}: ${e.message}（目标包名=$targetPackage，目标URI=$uri），换下一种")
             null
         }
     }
 
-    private fun browserOnlyFailure(context: Context, platform: String, packageName: String?, host: String, finalUrl: String): OpenResult {
+    private fun browserOnlyFailure(context: Context, platform: String, packageName: String?, host: String, finalUrl: String, targetKey: String = ""): OpenResult {
         val reason = "直达失败：只有浏览器可打开 host=$host finalUrl=$finalUrl"
         TaskStore.appendLog(context, "步骤3 $reason；已停止，不进入浏览器。")
-        return OpenResult(false, platform, packageName, "", reason)
+        return OpenResult(false, platform, packageName, "", reason, targetKey)
     }
 
     /**
@@ -243,9 +245,14 @@ object LinkResolver {
         val finalUrl = resolveFinalUrl(normalized)
         val host = Uri.parse(finalUrl).host ?: ""
         val target = detectKnown(normalized, finalUrl)
+        val targetKey = if (target != null) {
+            "${target.platform}|${target.id ?: finalUrl}"
+        } else {
+            "未知|$finalUrl"
+        }
         TaskStore.appendLog(
             context,
-            "步骤1 应用内解析：原始链接=$normalized，最终URL=$finalUrl，host=$host${if (target?.id != null) "，平台ID=${target.id}" else ""}"
+            "步骤1 应用内解析：原始链接=$normalized，最终URL=$finalUrl，host=$host${if (target?.id != null) "，平台ID=${target.id}" else ""}，防重复键=$targetKey"
         )
 
         if (target != null) {
@@ -253,7 +260,7 @@ object LinkResolver {
             if (!isInstalled(context, target.packageName)) {
                 val reason = "步骤2 检查 App 失败：手机没装${target.platform}（${target.packageName}），请先安装并登录"
                 TaskStore.appendLog(context, reason)
-                return OpenResult(false, target.platform, target.packageName, "", reason)
+                return OpenResult(false, target.platform, target.packageName, "", reason, targetKey)
             }
             TaskStore.appendLog(context, "步骤2 检查 App：${target.platform} 已安装")
 
@@ -263,38 +270,39 @@ object LinkResolver {
             if (normalized != finalUrl) candidates.add("原始链接直达" to Uri.parse(normalized))
 
             for ((method, uri) in candidates.distinctBy { it.second.toString() }) {
-                val opened = tryOpenWithPackage(context, uri, target.packageName, method, target.platform)
+                val opened = tryOpenWithPackage(context, uri, target.packageName, method, target.platform, targetKey)
                 if (opened != null) return opened
             }
 
             val resolvers = queryResolverPackages(context, Uri.parse(finalUrl))
             val nonBrowser = resolvers.filter { it !in browserPackages && it != context.packageName }
             if (nonBrowser.isEmpty()) {
-                return browserOnlyFailure(context, target.platform, target.packageName, host, finalUrl)
+                return browserOnlyFailure(context, target.platform, target.packageName, host, finalUrl, targetKey)
             }
             val reason = "直达失败：${target.platform} 不接这个链接 host=$host finalUrl=$finalUrl；非浏览器接管包名=${nonBrowser.joinToString(",")}，已停止，不进入浏览器"
             TaskStore.appendLog(context, "步骤3 $reason")
-            return OpenResult(false, target.platform, target.packageName, "", reason)
+            return OpenResult(false, target.platform, target.packageName, "", reason, targetKey)
         }
 
         val resolvers = queryResolverPackages(context, Uri.parse(finalUrl))
         val nonBrowser = resolvers.filter { it !in browserPackages && it != context.packageName }
         if (nonBrowser.isEmpty()) {
             return if (resolvers.isNotEmpty()) {
-                browserOnlyFailure(context, "未知", null, host, finalUrl)
+                browserOnlyFailure(context, "未知", null, host, finalUrl, targetKey)
             } else {
                 val reason = "直达失败：没有应用可打开 host=$host finalUrl=$finalUrl"
                 TaskStore.appendLog(context, "步骤3 $reason；已停止，不进入浏览器。")
-                OpenResult(false, "未知", null, "", reason)
+                OpenResult(false, "未知", null, "", reason, targetKey)
             }
         }
         val targetPackage = nonBrowser.first()
         TaskStore.appendLog(context, "步骤2 通用直达：最终URL 有非浏览器应用可接管，优先包名=$targetPackage，全部非浏览器包名=${nonBrowser.joinToString(",")}")
-        val opened = tryOpenWithPackage(context, Uri.parse(finalUrl), targetPackage, "最终链接直达", "直达应用")
+        val genericKey = "$targetPackage|$finalUrl"
+        val opened = tryOpenWithPackage(context, Uri.parse(finalUrl), targetPackage, "最终链接直达", "直达应用", genericKey)
         if (opened != null) return opened
         val reason = "直达失败：非浏览器应用 $targetPackage 没接住最终链接 host=$host finalUrl=$finalUrl"
         TaskStore.appendLog(context, "步骤3 $reason；已停止，不进入浏览器。")
-        return OpenResult(false, "直达应用", targetPackage, "", reason)
+        return OpenResult(false, "直达应用", targetPackage, "", reason, genericKey)
     }
 
     fun openVideoLink(context: Context, link: String): Boolean {
