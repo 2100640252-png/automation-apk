@@ -3,9 +3,9 @@ package com.automation.work
 import android.content.Context
 
 /**
- * 每平台点位记忆：评论点（打开评论区）和发送点（确认发送）由用户校准，
- * 按平台分别保存，软件记住后每次评论都按保存的位置真实点击。
- * 坐标存屏幕比例（0~1），换分辨率/横竖屏变化时按比例换算。
+ * 点位记忆：评论点和发送点由用户校准，按平台和名称保存。
+ * 坐标存屏幕比例（0~1），换分辨率时按比例换算。
+ * 发送点应在键盘打开、发送键可见时校准。
  */
 object PointStore {
 
@@ -15,6 +15,10 @@ object PointStore {
     const val KIND_SEND = "send"
 
     data class TapPoint(val x: Float, val y: Float)
+
+    fun displayName(kind: String): String {
+        return if (kind == KIND_SEND) "发送点" else "评论点"
+    }
 
     private fun key(platform: String, kind: String, axis: String) = "${platform}_${kind}_$axis"
 

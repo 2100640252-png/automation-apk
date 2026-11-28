@@ -12,12 +12,11 @@ android {
         applicationId = "com.automation.work"
         minSdk = 26
         targetSdk = 34
-        versionCode = 29
-        versionName = "4.2.0"
+        versionCode = 30
+        versionName = "4.3.0"
     }
 
-    // 固定签名（v1.4 新增）：用同一把签名钥匙签每一个 Release 包，
-    // 以后更新签名都一样，不会再报签名冲突。
+    // 固定签名：用同一把签名钥匙签每一个 Release 包。
     // 钥匙文件和密码存在 GitHub Secrets 里，不进仓库、不进代码：
     // ANDROID_KEYSTORE_BASE64、KEYSTORE_PASSWORD、KEY_ALIAS、KEY_PASSWORD。
     // 本地没有这些环境变量时，release 构建不设签名（不影响 debug 开发）。
@@ -59,12 +58,6 @@ android {
     buildFeatures {
         compose = true
     }
-
-    packaging {
-        resources {
-            excludes += "META-INF/versions/9/OSGI-INF/MANIFEST.MF"
-        }
-    }
 }
 
 dependencies {
@@ -73,14 +66,5 @@ dependencies {
     implementation("androidx.compose.ui:ui:1.7.2")
     implementation("androidx.compose.ui:ui-tooling-preview:1.7.2")
     implementation("androidx.compose.material3:material3:1.3.0")
-    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.5")
-    implementation("androidx.work:work-runtime-ktx:2.9.0")
-    implementation("dev.rikka.shizuku:api:12.1.0")
-    // ShizukuProvider 单独在这个包里：Manifest 声明的 rikka.shizuku.ShizukuProvider
-    // 必须有它，App 启动时系统才会初始化 Shizuku；缺了它一点开就闪退（v1.7.0 的 bug）。
-    implementation("dev.rikka.shizuku:provider:12.1.0")
-    implementation("androidx.datastore:datastore-preferences:1.1.1")
-    implementation("com.flyfishxu:kadb:1.3.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     debugImplementation("androidx.compose.ui:ui-tooling:1.7.2")
 }

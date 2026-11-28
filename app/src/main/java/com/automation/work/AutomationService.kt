@@ -5,6 +5,7 @@ import android.accessibilityservice.GestureDescription
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -34,7 +35,7 @@ import android.widget.Toast
 /**
  * 无障碍屏幕控制服务（v1.8 诊断版）。
  *
- * 不用 Root、不用 Shizuku。流程（每条链接）：
+ * 只用无障碍服务和它自己的悬浮层。流程（一条用户手动开始的链接）：
  *  步骤1-3 LinkResolver 在后台线程解析链接、直开对应平台 App（绝不走浏览器）
  *  步骤4 验证当前界面确实是目标 App（被浏览器接走就报失败）
  *  步骤5 找评论入口并点开
@@ -43,8 +44,7 @@ import android.widget.Toast
  *  步骤8 验证评论真的发出去了（输入框清空或评论出现在界面上）
  * 每一步失败都写明卡在哪一步、为什么，不谎报成功。
  *
- * 发视频辅助：视频交给平台发布页后，本服务在发布页里填文案、点下一步/发布，
- * 并验证是否出现发布成功；验证不到就写明失败原因。
+ * 本版只处理一条用户手动开始的链接评论任务；触发自检未通过时不开始评论。
  */
 class AutomationService : AccessibilityService() {
 
@@ -61,6 +61,19 @@ class AutomationService : AccessibilityService() {
         var expectedPackage: String? = null
         var expectedPlatform: String = ""
 
+        // 触发优先门禁：服务实例、悬浮按钮添加结果、触发自检回显都必须真实成立。
+        @Volatile var overlayReady: Boolean = false
+        @Volatile var overlayStatus: String = "悬浮按钮未添加：无障碍服务未连接"
+        @Volatile var triggerSelfTestPassed: Boolean = false
+        @Volatile var triggerSelfTestStatus: String = "触发自检未通过：尚未运行测试触发"
+        @Volatile var triggerSelfTestAtMillis: Long = 0L
+        @Volatile var lastTriggerEchoAtMillis: Long = 0L
+        @Volatile var lastTriggerEchoSource: String = ""
+        @Volatile var overlayTapEchoCount: Int = 0
+        @Volatile var lastOverlayTapEchoAtMillis: Long = 0L
+        private var pendingSelfTestStartedAt: Long = 0L
+        private var pendingSelfTestSource: String = ""
+
         // 真人介入状态：失败后暂停自动化，弹出悬浮窗让真人操作、设定、报告错误。
         var pausedForHuman: Boolean = false
         var lastFailureReason: String = ""
@@ -73,15 +86,87 @@ class AutomationService : AccessibilityService() {
         var publishPackage: String = ""
         var publishCaption: String = ""
         var publishAttempts: Int = 0
+        var publishBaselineSuccessCount: Int = -1
+        var publishClicked: Boolean = false
 
         private val handler = Handler(Looper.getMainLooper())
         private var stepRunnable: Runnable? = null
         private var publishRunnable: Runnable? = null
 
-        fun startTask(context: Context, task: CommentTask) {
+        private fun timeText(millis: Long): String {
+            if (millis <= 0L) return "无"
+            return java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date(millis))
+        }
+
+        fun gateFailureReason(): String? {
             if (instance == null) {
+                return "步骤0 失败：无障碍服务没在运行，请先在设置 > 无障碍里开启“自动化屏幕控制”。"
+            }
+            if (!overlayReady) {
+                return "步骤0 失败：悬浮按钮未有效启用：$overlayStatus"
+            }
+            if (!triggerSelfTestPassed) {
+                return "步骤0 失败：触发自检未通过：$triggerSelfTestStatus"
+            }
+            return null
+        }
+
+        fun statusSummary(): String {
+            val serviceText = if (instance == null) "未连接" else "已连接"
+            val overlayEcho = if (lastOverlayTapEchoAtMillis > 0L) {
+                "已回显 $overlayTapEchoCount 次，最近 ${timeText(lastOverlayTapEchoAtMillis)}"
+            } else {
+                "未回显"
+            }
+            return "无障碍服务：$serviceText\n悬浮按钮：$overlayStatus\n触发自检：$triggerSelfTestStatus\n悬浮按钮回显：$overlayEcho\n任务状态：$lastStatus"
+        }
+
+        fun markTriggerEcho(context: Context, source: String) {
+            lastTriggerEchoAtMillis = System.currentTimeMillis()
+            lastTriggerEchoSource = source
+            TaskStore.appendLog(context, "触发回显：$source 已收到点击回显，时间=${timeText(lastTriggerEchoAtMillis)}")
+        }
+
+        fun runTriggerSelfTest(context: Context, xPx: Int, yPx: Int, source: String, onResult: (Boolean, String) -> Unit) {
+            val svc = instance
+            if (svc == null) {
+                triggerSelfTestPassed = false
+                triggerSelfTestStatus = "触发自检失败：无障碍服务未连接，无法派发手势"
+                TaskStore.appendLog(context, triggerSelfTestStatus)
+                onResult(false, triggerSelfTestStatus)
+                return
+            }
+            svc.runTriggerSelfTestInternal(xPx, yPx, source, onResult)
+        }
+
+        fun showOverlayNow(context: Context) {
+            val svc = instance
+            if (svc == null) {
+                overlayReady = false
+                overlayStatus = "悬浮按钮添加失败：无障碍服务未连接，无法调用 WindowManager.addView"
+                TaskStore.appendLog(context, overlayStatus)
+                return
+            }
+            svc.showMiniOverlay()
+        }
+
+        fun startTask(context: Context, task: CommentTask) {
+            val gate = gateFailureReason()
+            if (gate != null) {
                 running = false
-                lastStatus = "步骤0 失败：无障碍服务没在运行，请先在设置 > 无障碍里开启“自动化屏幕控制”。"
+                lastStatus = gate
+                TaskStore.appendLog(context, lastStatus)
+                return
+            }
+            if (task.items.size != 1) {
+                running = false
+                lastStatus = "步骤0 失败：本版只允许一条用户手动开始的链接任务，收到 ${task.items.size} 条。"
+                TaskStore.appendLog(context, lastStatus)
+                return
+            }
+            if (task.commentText.isBlank() || task.items.first().link.isBlank()) {
+                running = false
+                lastStatus = "步骤0 失败：链接或评论为空，不能开始。"
                 TaskStore.appendLog(context, lastStatus)
                 return
             }
@@ -161,33 +246,15 @@ class AutomationService : AccessibilityService() {
             svc.showInterventionPanel(lastFailureReason.ifBlank { "手动打开悬浮控制窗：可以手动操作、重新识别、校准点位、记录点击、保存错误报告。" }, pauseAutomation = false)
         }
 
-        fun runSequenceNow(context: Context, platform: String, comment: String) {
-            val svc = instance
-            if (svc == null) {
-                TaskStore.appendLog(context, "执行失败：无障碍服务没在运行，请先开启无障碍。")
-                return
-            }
-            svc.runSequence(platform, comment)
-        }
-
-        fun startRecorder(context: Context, platform: String) {
-            val svc = instance
-            if (svc == null) {
-                TaskStore.appendLog(context, "记录失败：无障碍服务没在运行，请先开启无障碍。")
-                return
-            }
-            svc.showRecorder(platform)
-        }
-
         fun stopTask(context: Context) {
             running = false
             publishRunning = false
             pausedForHuman = false
             stepRunnable?.let { handler.removeCallbacks(it) }
             publishRunnable?.let { handler.removeCallbacks(it) }
-            instance?.removeIntervention()
             lastStatus = "任务已停止"
             TaskStore.appendLog(context, lastStatus)
+            instance?.showMiniOverlay()
         }
 
         fun openCurrent(context: Context) {
@@ -219,6 +286,7 @@ class AutomationService : AccessibilityService() {
                     }
                     expectedPackage = result.packageName
                     expectedPlatform = result.platform
+                    TaskStore.appendLog(context, "步骤4 等待目标窗口：期望前台包名=${result.packageName}，打开方式=${result.method}；超时内验证，浏览器在前台或目标未到前台会停在步骤4。")
                     instance?.resetSendState()
                     instance?.scheduleStep(context, 3000L)
                 }
@@ -243,33 +311,102 @@ class AutomationService : AccessibilityService() {
             }
         }
 
-        /** 发视频辅助：发布页打开后，自动填文案、点下一步/发布，并验证结果。 */
-        fun startPublishAssist(context: Context, platform: String, packageName: String, caption: String) {
-            if (instance == null) {
-                TaskStore.appendLog(context, "发视频步骤5 失败：无障碍服务没在运行，只能打开发布页，不能自动点发布。请开启无障碍后重试。")
+        fun startDirectOpenTest(context: Context, link: String) {
+            val gate = gateFailureReason()
+            if (gate != null) {
+                lastStatus = gate
+                TaskStore.appendLog(context, gate)
                 return
             }
-            publishPlatform = platform
-            publishPackage = packageName
+            if (link.isBlank()) {
+                lastStatus = "直达测试失败：先填写视频链接。"
+                TaskStore.appendLog(context, lastStatus)
+                return
+            }
+            instance?.showMiniOverlay()
+            lastStatus = "直达测试开始：正在应用内解析链接并打开目标 App…"
+            TaskStore.appendLog(context, lastStatus)
+            Thread {
+                val result = LinkResolver.openVideoLinkDetailed(context, link)
+                handler.post {
+                    if (!result.success) {
+                        lastStatus = result.reason
+                        TaskStore.appendLog(context, "直达测试停止：${result.reason}")
+                        TaskStore.saveErrorReport(
+                            context,
+                            "错误报告\n时间：${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())}\n任务：直达测试\n链接：$link\n平台：${result.platform}\n期望包名：${result.packageName ?: "未知"}\n错误：${result.reason}\n"
+                        )
+                        instance?.showInterventionPanel(result.reason, pauseAutomation = false)
+                        return@post
+                    }
+                    expectedPackage = result.packageName
+                    expectedPlatform = result.platform
+                    lastStatus = "直达测试：VIEW intent 已发出，等待目标 App 到前台（期望包名=${result.packageName}）"
+                    TaskStore.appendLog(context, "步骤4 等待目标窗口：期望前台包名=${result.packageName}，打开方式=${result.method}；超时内验证，浏览器在前台或目标未到前台会停在步骤4。")
+                    instance?.scheduleDirectVerify(context, 1500L)
+                }
+            }.start()
+        }
+
+        fun startPublishAssistByLink(context: Context, link: String, caption: String) {
+            val gate = gateFailureReason()
+            if (gate != null) {
+                lastStatus = gate
+                TaskStore.appendLog(context, gate)
+                return
+            }
+            if (link.isBlank()) {
+                lastStatus = "发布辅助失败：先填写视频链接。"
+                TaskStore.appendLog(context, lastStatus)
+                return
+            }
+            instance?.showMiniOverlay()
+            publishRunning = false
             publishCaption = caption
             publishAttempts = 0
-            pausedForHuman = false
-            lastFailureReason = ""
-            lastFailureKind = ""
-            instance?.showMiniOverlay()
-            publishRunning = true
-            TaskStore.appendLog(context, "发视频步骤5：发布页已打开，开始自动填文案、点发布（$platform）…")
-            instance?.schedulePublishStep(context, 3000L)
+            publishBaselineSuccessCount = -1
+            publishClicked = false
+            lastStatus = "发布辅助开始：正在应用内解析视频链接并直达目标 App…"
+            TaskStore.appendLog(context, lastStatus)
+            Thread {
+                val result = LinkResolver.openVideoLinkDetailed(context, link)
+                handler.post {
+                    expectedPackage = result.packageName
+                    expectedPlatform = result.platform
+                    publishPlatform = result.platform
+                    publishPackage = result.packageName ?: ""
+                    if (!result.success) {
+                        publishRunning = false
+                        lastStatus = result.reason
+                        TaskStore.appendLog(context, "发布辅助停止：${result.reason}")
+                        TaskStore.saveErrorReport(
+                            context,
+                            "错误报告\n时间：${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault()).format(java.util.Date())}\n任务：发布辅助\n链接：$link\n平台：${result.platform}\n期望包名：${result.packageName ?: "未知"}\n错误：${result.reason}\n"
+                        )
+                        instance?.showInterventionPanel(result.reason, pauseAutomation = false)
+                        return@post
+                    }
+                    publishRunning = true
+                    pausedForHuman = false
+                    lastFailureReason = ""
+                    lastFailureKind = ""
+                    lastStatus = "发布辅助：已直达${result.platform}，等待目标窗口和发布页验证…"
+                    TaskStore.appendLog(context, "步骤4 等待目标窗口：期望前台包名=${result.packageName}，打开方式=${result.method}；发布成功只认点击后新出现的发布成功状态。")
+                    instance?.schedulePublishStep(context, 2500L)
+                }
+            }.start()
         }
     }
 
     private var attempts: Int = 0
+    private var directVerifyAttempts: Int = 0
     private var sendStage: Int = 0
     private var sendWaitAttempts: Int = 0
     private var pasteTried: Boolean = false
     private var lastVisionSummary: String = "未使用截图视觉兜底"
     private var preSendProbeCount: Int = 0
     private var interventionRoot: View? = null
+    private var overlaySelfTestTarget: Button? = null
     private var interventionNote: EditText? = null
     private var interventionStatus: TextView? = null
     private var interventionSnapshot: TextView? = null
@@ -281,7 +418,13 @@ class AutomationService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        TaskStore.appendLog(this, "无障碍服务已连接，可以开始任务。")
+        overlayReady = false
+        overlayStatus = "无障碍服务已连接，正在用 TYPE_ACCESSIBILITY_OVERLAY 添加悬浮按钮"
+        triggerSelfTestPassed = false
+        triggerSelfTestStatus = "触发自检未通过：服务刚连接，尚未运行测试触发"
+        triggerSelfTestAtMillis = 0L
+        TaskStore.appendLog(this, "无障碍服务已连接：服务实例已建立，立即添加悬浮按钮；评论开始前必须先通过测试触发。")
+        showMiniOverlay()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -289,11 +432,16 @@ class AutomationService : AccessibilityService() {
         if (event.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             event.eventType != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) return
-        if (interventionRoot == null) {
+        if (interventionRoot == null && calibrationRoot == null) {
             when (overlayMode) {
                 "panel" -> showInterventionPanel(panelReason.ifBlank { "悬浮控制窗" }, pauseAutomation = pausedForHuman)
                 "mini" -> showMiniOverlay()
                 "manual" -> showManualBar()
+                else -> {
+                    if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && !overlayReady) {
+                        showMiniOverlay()
+                    }
+                }
             }
         }
         if (pausedForHuman) return
@@ -319,6 +467,43 @@ class AutomationService : AccessibilityService() {
         val r = Runnable { tryPublishStep(context) }
         publishRunnable = r
         handler.postDelayed(r, delayMs)
+    }
+
+    private fun scheduleDirectVerify(context: Context, delayMs: Long) {
+        handler.postDelayed({ verifyDirectForeground(context) }, delayMs)
+    }
+
+    private fun verifyDirectForeground(context: Context) {
+        val expected = expectedPackage
+        val root = rootInActiveWindow
+        val pkg = root?.packageName?.toString() ?: ""
+        if (expected != null && pkg == expected) {
+            directVerifyAttempts = 0
+            lastStatus = "直达验证通过：前台包名=$pkg，平台=$expectedPlatform"
+            TaskStore.appendLog(context, "步骤4 直达验证通过：期望前台包名=$expected，实际前台包名=$pkg")
+            showMiniOverlay()
+            return
+        }
+        if (pkg in browserPackages) {
+            val reason = "步骤4 失败：浏览器在前台（实际包名=$pkg），目标 App 没有接管；已停止，不用浏览器页面状态作证明"
+            lastStatus = reason
+            saveCurrentErrorReport(context, reason, "")
+            TaskStore.appendLog(context, reason)
+            showInterventionPanel(reason, pauseAutomation = false)
+            return
+        }
+        directVerifyAttempts++
+        TaskStore.appendLog(context, "步骤4 直达验证：期望前台包名=${expected ?: "未知"}，实际前台包名=${pkg.ifBlank { "拿不到窗口" }}（第 $directVerifyAttempts 次）")
+        if (directVerifyAttempts >= 5) {
+            directVerifyAttempts = 0
+            val reason = "步骤4 失败：超时后目标 App 仍未到前台（期望包名=${expected ?: "未知"}，实际包名=${pkg.ifBlank { "拿不到窗口" }}）"
+            lastStatus = reason
+            saveCurrentErrorReport(context, reason, "")
+            TaskStore.appendLog(context, reason)
+            showInterventionPanel(reason, pauseAutomation = false)
+        } else {
+            scheduleDirectVerify(context, 2000L)
+        }
     }
 
     private val browserPackages = setOf(
@@ -377,6 +562,28 @@ class AutomationService : AccessibilityService() {
         return count
     }
 
+    private fun normalizedText(text: String): String {
+        return text.trim().replace(Regex("\\s+"), " ")
+    }
+
+    private fun inputMatchesComment(inputText: String, commentText: String): Boolean {
+        val input = normalizedText(inputText)
+        val comment = normalizedText(commentText)
+        if (comment.isBlank()) return false
+        return input == comment || input.contains(comment)
+    }
+
+    private fun isLoginBlock(text: String): Boolean {
+        return listOf("请先登录", "立即登录", "登录后", "登录账号", "未登录", "去登录").any { text.contains(it) }
+    }
+
+    private fun isSecurityBlock(text: String): Boolean {
+        return listOf(
+            "验证码", "滑块", "安全验证", "身份验证", "人机验证", "请完成验证",
+            "拖动滑块", "账号异常", "风险提示", "操作频繁", "请稍后再试"
+        ).any { text.contains(it) }
+    }
+
     fun resetSendState() {
         sendStage = 0
         sendWaitAttempts = 0
@@ -418,12 +625,12 @@ class AutomationService : AccessibilityService() {
             return
         }
         val allText = treeText(root)
-        if (allText.contains("请先登录") || allText.contains("立即登录") || allText.contains("登录后")) {
-            interveneCurrent(context, task, "步骤5 失败：$expectedPlatform 要求登录，请先在 App 里登录账号")
+        if (isLoginBlock(allText)) {
+            interveneCurrent(context, task, "步骤5 失败：$expectedPlatform 要求登录。期望状态=已登录的视频页，实际状态=页面出现登录提示；请先在 App 里登录账号")
             return
         }
-        if (allText.contains("验证码") || allText.contains("滑块") || allText.contains("安全验证")) {
-            interveneCurrent(context, task, "步骤5 失败：$expectedPlatform 弹出了验证（验证码/滑块），自动评论被平台拦下")
+        if (isSecurityBlock(allText)) {
+            interveneCurrent(context, task, "步骤5 失败：$expectedPlatform 弹出了安全检查。期望状态=可评论的视频页，实际状态=页面出现验证码/滑块/安全验证；已停止自动操作")
             return
         }
         // 步骤6：找评论输入框。快手/抖音的发送键常是右下角图标、没有文字，
@@ -432,7 +639,7 @@ class AutomationService : AccessibilityService() {
         if (input != null) {
             val probe = commentProbe(task)
             val existingText = input.text?.toString() ?: ""
-            if (existingText.contains(probe)) {
+            if (inputMatchesComment(existingText, task.commentText)) {
                 if (sendStage == 0) {
                     preSendProbeCount = countOccurrences(textOutsideInput(root, input), probe)
                     TaskStore.appendLog(context, "步骤6 填评论：输入框里已有评论，直接进入发送（发送前评论区同文案出现 $preSendProbeCount 次）。")
@@ -547,7 +754,7 @@ class AutomationService : AccessibilityService() {
         val input = findEditableCommentBox(root)
         val probe = commentProbe(task)
         val inputText = input?.text?.toString() ?: ""
-        if (input == null || !inputText.contains(probe)) {
+        if (input == null || !inputMatchesComment(inputText, task.commentText)) {
             TaskStore.appendLog(context, "步骤7 点发送：输入框里没有待发送评论，回到填评论步骤重新确认。")
             scheduleStep(context, 1200L)
             return
@@ -648,14 +855,19 @@ class AutomationService : AccessibilityService() {
         if (!running || pausedForHuman) return
         val root = rootInActiveWindow
         val probe = commentProbe(task)
+        val allText = root?.let { treeText(it) } ?: ""
+        if (isLoginBlock(allText) || isSecurityBlock(allText)) {
+            interveneCurrent(context, task, "步骤8 失败：发送后出现登录或安全检查。期望状态=评论出现在输入框外，实际状态=页面出现登录/验证码/安全验证；已停止自动操作")
+            return
+        }
         val input = root?.let { findEditableCommentBox(it) }
         val inputText = input?.text?.toString() ?: ""
         val outsideText = root?.let { textOutsideInput(it, input) } ?: ""
         val outsideCount = countOccurrences(outsideText, probe)
-        val inputContains = inputText.contains(probe)
+        val inputContains = inputText.contains(probe) || inputMatchesComment(inputText, task.commentText)
         val inputCleared = input == null || inputText.isBlank() || !inputContains
-        val successWords = outsideText.contains("评论成功") || outsideText.contains("发送成功")
-        val sent = !inputContains && (outsideCount > preSendProbeCount || successWords)
+        val sent = !inputContains && outsideCount > preSendProbeCount
+        TaskStore.appendLog(context, "步骤8 防假成功验证：期望输入框外同文案 > $preSendProbeCount，实际 $outsideCount；输入框仍含评论=$inputContains（输入框文字不计入成功）。")
         if (sent) {
             TaskStore.appendLog(context, "步骤8 验证：评论已发出（输入框外同文案从 $preSendProbeCount 次变为 $outsideCount 次）。")
             markItemSuccess(context)
@@ -684,51 +896,105 @@ class AutomationService : AccessibilityService() {
         if (!publishRunning || pausedForHuman) return
         val root = rootInActiveWindow ?: run {
             publishAttempts++
+            TaskStore.appendLog(context, "发视频步骤4 验证窗口：拿不到当前窗口（第 $publishAttempts 次），期望包名=$publishPackage")
             if (publishAttempts >= 6) {
-                intervenePublish(context, "发视频步骤6 失败：拿不到发布页界面（$publishPlatform）")
+                intervenePublish(context, "发视频步骤4 失败：超时后拿不到目标窗口（期望包名=$publishPackage）")
             } else schedulePublishStep(context, 3000L)
             return
         }
         val rootPkg = root.packageName?.toString() ?: ""
+        if (rootPkg in browserPackages) {
+            intervenePublish(context, "发视频步骤4 失败：浏览器在前台（实际包名=$rootPkg），目标 App 没有接管；已停止，不用浏览器页面状态作证明")
+            return
+        }
         if (rootPkg != publishPackage) {
             publishAttempts++
-            TaskStore.appendLog(context, "发视频步骤6：当前不在$publishPlatform 发布页（当前：$rootPkg），等待…（第 $publishAttempts 次）")
+            TaskStore.appendLog(context, "发视频步骤4 验证窗口：期望前台包名=$publishPackage，实际前台包名=$rootPkg（第 $publishAttempts 次）")
             if (publishAttempts >= 6) {
-                intervenePublish(context, "发视频步骤6 失败：发布页没有打开（当前应用：$rootPkg）")
+                intervenePublish(context, "发视频步骤4 失败：超时后目标 App 仍未到前台（期望包名=$publishPackage，实际包名=$rootPkg）")
             } else schedulePublishStep(context, 3000L)
             return
         }
         val allText = treeText(root)
-        if (allText.contains("发布成功") || allText.contains("已发布") || allText.contains("投稿成功")) {
-            publishRunning = false
-            pausedForHuman = false
-            removeIntervention()
-            lastStatus = "视频已发布到$publishPlatform（已验证）。"
-            TaskStore.appendLog(context, "发视频步骤8 验证：$publishPlatform 显示发布成功。")
+        if (isLoginBlock(allText) || isSecurityBlock(allText)) {
+            intervenePublish(context, "发视频步骤5 失败：$publishPlatform 出现登录或安全检查。期望状态=已登录的发布页，实际状态=页面出现登录/验证码/安全验证；已停止自动操作")
             return
         }
-        // 填文案
-        if (publishCaption.isNotBlank()) {
-            val input = findEditableCommentBox(root)
-            val cur = input?.text?.toString() ?: ""
-            if (input != null && !cur.contains(publishCaption.take(6))) {
-                if (setText(input, publishCaption)) {
-                    TaskStore.appendLog(context, "发视频步骤6：已填文案。")
-                }
-            }
+        fun successCount(): Int {
+            return listOf("发布成功", "已发布", "投稿成功", "发布完成").sumOf { countOccurrences(allText, it) }
         }
-        // 点下一步/发布
-        val btn = findPublishButton(root)
-        if (btn != null && clickNode(btn)) {
+        val currentSuccessCount = successCount()
+        if (publishBaselineSuccessCount < 0) {
+            publishBaselineSuccessCount = currentSuccessCount
+            TaskStore.appendLog(context, "发视频步骤5 记录基线：点击发布前成功字样出现 $publishBaselineSuccessCount 次；已有字样不计入本次成功。")
+        }
+        if (publishClicked && currentSuccessCount > publishBaselineSuccessCount) {
+            publishRunning = false
+            pausedForHuman = false
+            showMiniOverlay()
+            lastStatus = "视频发布已验证：$publishPlatform 出现新的发布成功状态（基线 $publishBaselineSuccessCount -> $currentSuccessCount）。"
+            TaskStore.appendLog(context, "发视频步骤8 验证：$publishPlatform 出现新的发布成功状态（基线 $publishBaselineSuccessCount -> $currentSuccessCount）。")
+            return
+        }
+        val input = findEditableCommentBox(root)
+        val publishIndicators = listOf("发布作品", "添加标题", "标题", "作品描述", "发布设置", "下一步", "发布", "Post")
+        val isPublishPage = input != null || publishIndicators.any { allText.contains(it) }
+        if (!isPublishPage) {
             publishAttempts++
-            TaskStore.appendLog(context, "发视频步骤7：已点发布按钮（第 $publishAttempts 次），等待验证…")
+            val summary = allText.replace(Regex("\\s+"), " ").trim().take(120)
+            TaskStore.appendLog(context, "发视频步骤6 识别发布页：已直达 $publishPlatform，但当前不是发布页（第 $publishAttempts 次），页面摘要=$summary")
             if (publishAttempts >= 6) {
-                intervenePublish(context, "发视频步骤8 失败：点了发布但没有验证到发布成功（可能需要登录、验证或平台审核）")
+                intervenePublish(context, "发视频步骤6 失败：已直达目标 App，但当前不是发布页；请手动进入发布页后点继续")
             } else schedulePublishStep(context, 3000L)
             return
         }
+        if (publishCaption.isNotBlank()) {
+            if (input == null) {
+                publishAttempts++
+                TaskStore.appendLog(context, "发视频步骤6 填文案：发布页没有可填输入框（第 $publishAttempts 次）")
+                if (publishAttempts >= 6) {
+                    intervenePublish(context, "发视频步骤6 失败：发布页找不到可填文案的输入框")
+                } else schedulePublishStep(context, 3000L)
+                return
+            }
+            val cur = input.text?.toString() ?: ""
+            if (!inputMatchesComment(cur, publishCaption)) {
+                val filled = fillCommentText(input, publishCaption, publishCaption.take(12))
+                if (filled) {
+                    TaskStore.appendLog(context, "发视频步骤6 填文案：已填入并验证文案在输入框里。")
+                } else {
+                    publishAttempts++
+                    TaskStore.appendLog(context, "发视频步骤6 填文案：填入后验证不到完整文案（第 $publishAttempts 次）")
+                    if (publishAttempts >= 6) {
+                        intervenePublish(context, "发视频步骤6 失败：文案填不进去或验证不到完整文案")
+                    } else schedulePublishStep(context, 3000L)
+                    return
+                }
+            }
+        }
+        val btn = findPublishButton(root)
+        if (btn != null) {
+            if (clickNode(btn)) {
+                publishClicked = true
+                publishAttempts++
+                TaskStore.appendLog(context, "发视频步骤7 点发布：已点击发布控件，等待点击后新出现的发布成功状态（第 $publishAttempts 次）")
+                if (publishAttempts >= 8) {
+                    intervenePublish(context, "发视频步骤8 失败：点了发布但没有验证到新的发布成功状态（基线 $publishBaselineSuccessCount，当前 $currentSuccessCount）")
+                } else schedulePublishStep(context, 3000L)
+                return
+            }
+            publishClicked = true
+            publishAttempts++
+            tapNodeCenter(btn, "发视频步骤7 点发布") {
+                TaskStore.appendLog(context, "发视频步骤7 点发布：发布控件点击无效，已按坐标点击，等待新的发布成功状态")
+                if (publishAttempts >= 8) {
+                    intervenePublish(context, "发视频步骤8 失败：点了发布但没有验证到新的发布成功状态（基线 $publishBaselineSuccessCount，当前 $currentSuccessCount）")
+                } else schedulePublishStep(context, 3000L)
+            }
+            return
+        }
         publishAttempts++
-        TaskStore.appendLog(context, "发视频步骤7：发布页上没有找到发布按钮（第 $publishAttempts 次）")
+        TaskStore.appendLog(context, "发视频步骤7 点发布：发布页上没有找到发布按钮（第 $publishAttempts 次）")
         if (publishAttempts >= 6) {
             intervenePublish(context, "发视频步骤7 失败：找不到发布按钮，请手动点发布")
         } else schedulePublishStep(context, 3000L)
@@ -748,7 +1014,7 @@ class AutomationService : AccessibilityService() {
         lastFailureKind = ""
         currentFailureCounted = false
         if (currentIndex >= task.items.size) {
-            removeIntervention()
+            showMiniOverlay()
             running = false
             lastStatus = finishStatus()
             TaskStore.appendLog(context, lastStatus)
@@ -909,7 +1175,13 @@ class AutomationService : AccessibilityService() {
         removeIntervention()
         pausedForHuman = pauseAutomation
         panelReason = reason
-        val wm = getSystemService(WindowManager::class.java) ?: return
+        val wm = getSystemService(WindowManager::class.java)
+        if (wm == null) {
+            overlayReady = false
+            overlayStatus = "悬浮控制窗添加失败：WindowManager 不可用，无法调用 addView"
+            TaskStore.appendLog(this, overlayStatus)
+            return
+        }
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.argb(238, 18, 18, 18))
@@ -961,10 +1233,20 @@ class AutomationService : AccessibilityService() {
         panel.addView(error)
         panel.addView(snapshot)
         panel.addView(note)
+        val selfTestTarget = Button(this).apply {
+            text = "触发检测区：未回显"
+            setOnClickListener {
+                markTriggerEcho(this@AutomationService, "悬浮窗检测区")
+                text = "触发检测区：已回显 ${timeText(lastTriggerEchoAtMillis)}"
+                updateInterventionPanel()
+            }
+        }
+        overlaySelfTestTarget = selfTestTarget
+        panel.addView(selfTestTarget)
         panel.addView(row(
             btn("重试当前步") { resumeAfterIntervention(this) },
             btn("我来操作") { showManualBar() },
-            btn("继续识别") { resumeAfterIntervention(this) }
+            btn("开始/继续") { resumeAfterIntervention(this) }
         ))
         panel.addView(row(
             btn("平台：${platformForIntervention()}") {
@@ -988,10 +1270,7 @@ class AutomationService : AccessibilityService() {
                 saveCurrentErrorReport(this, reason, note.text?.toString() ?: "")
                 Toast.makeText(this, "错误报告已保存", Toast.LENGTH_SHORT).show()
             },
-            btn("记录点击") {
-                removeIntervention()
-                showRecorder(platformForIntervention())
-            },
+            btn("测试触发") { runOverlayTriggerSelfTest() },
             btn("刷新状态") { updateInterventionPanel() }
         ))
         panel.addView(row(
@@ -1004,17 +1283,22 @@ class AutomationService : AccessibilityService() {
             wm.addView(scroll, interventionParams(Gravity.BOTTOM, focusable = true))
             interventionRoot = scroll
             overlayMode = "panel"
+            overlayReady = true
+            overlayStatus = "悬浮控制窗已显示：TYPE_ACCESSIBILITY_OVERLAY 添加成功"
+            TaskStore.appendLog(this, overlayStatus)
             updateInterventionPanel()
             schedulePanelRefresh()
         } catch (e: Exception) {
-            TaskStore.appendLog(this, "真人介入窗打开失败：${e.message}")
+            overlayReady = false
+            overlayStatus = "悬浮控制窗添加失败：WindowManager.addView 失败：${e.javaClass.simpleName}: ${e.message}"
+            TaskStore.appendLog(this, overlayStatus)
         }
     }
 
     private fun updateInterventionPanel() {
         val platform = platformForIntervention()
         val lastLog = TaskStore.loadLog(this).lines().lastOrNull { it.isNotBlank() } ?: "暂无日志"
-        interventionStatus?.text = "实时状态：$lastStatus\n最新日志：$lastLog\n校准平台：$platform · 评论点 ${PointStore.describe(this, platform, PointStore.KIND_COMMENT)} · 发送点 ${PointStore.describe(this, platform, PointStore.KIND_SEND)}"
+        interventionStatus?.text = "实时状态：$lastStatus\n悬浮按钮：$overlayStatus\n触发自检：$triggerSelfTestStatus\n最新日志：$lastLog\n校准平台：$platform · 评论点 ${PointStore.describe(this, platform, PointStore.KIND_COMMENT)} · 发送点 ${PointStore.describe(this, platform, PointStore.KIND_SEND)}"
         val root = rootInActiveWindow
         val pkg = root?.packageName?.toString() ?: "拿不到窗口"
         val txt = root?.let { treeText(it).replace(Regex("\\s+"), " ").trim().take(180) } ?: ""
@@ -1035,17 +1319,26 @@ class AutomationService : AccessibilityService() {
 
     fun showMiniOverlay() {
         removeIntervention()
-        val wm = getSystemService(WindowManager::class.java) ?: return
+        val wm = getSystemService(WindowManager::class.java)
+        if (wm == null) {
+            overlayReady = false
+            overlayStatus = "悬浮按钮添加失败：WindowManager 不可用，无法调用 addView"
+            TaskStore.appendLog(this, overlayStatus)
+            return
+        }
         val mini = Button(this).apply {
             text = "控"
             textSize = 15f
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.argb(235, 15, 23, 42))
-            setOnClickListener { showInterventionPanel(panelReason.ifBlank { "悬浮控制窗" }, pauseAutomation = pausedForHuman) }
-            setOnLongClickListener {
-                overlayMode = "none"
-                removeIntervention()
-                true
+            setOnClickListener {
+                overlayTapEchoCount++
+                lastOverlayTapEchoAtMillis = System.currentTimeMillis()
+                text = "已点"
+                TaskStore.appendLog(this@AutomationService, "悬浮按钮回显：右侧“控”按钮被点击，第 $overlayTapEchoCount 次，时间=${timeText(lastOverlayTapEchoAtMillis)}")
+                handler.postDelayed({
+                    showInterventionPanel(panelReason.ifBlank { "悬浮控制窗" }, pauseAutomation = pausedForHuman)
+                }, 250L)
             }
         }
         val params = WindowManager.LayoutParams(
@@ -1059,16 +1352,26 @@ class AutomationService : AccessibilityService() {
             wm.addView(mini, params)
             interventionRoot = mini
             overlayMode = "mini"
-            TaskStore.appendLog(this, "悬浮窗已最小化：右侧“控”按钮会保留，点它展开控制窗，长按关闭。")
+            overlayReady = true
+            overlayStatus = "悬浮按钮已显示：TYPE_ACCESSIBILITY_OVERLAY 添加成功，右侧“控”按钮可见"
+            TaskStore.appendLog(this, overlayStatus)
         } catch (e: Exception) {
-            TaskStore.appendLog(this, "悬浮窗最小化失败：${e.message}")
+            overlayReady = false
+            overlayStatus = "悬浮按钮添加失败：WindowManager.addView 失败：${e.javaClass.simpleName}: ${e.message}"
+            TaskStore.appendLog(this, overlayStatus)
         }
     }
 
     private fun showManualBar() {
         removeIntervention()
         pausedForHuman = true
-        val wm = getSystemService(WindowManager::class.java) ?: return
+        val wm = getSystemService(WindowManager::class.java)
+        if (wm == null) {
+            overlayReady = false
+            overlayStatus = "真人操作条添加失败：WindowManager 不可用，无法调用 addView"
+            TaskStore.appendLog(this, overlayStatus)
+            return
+        }
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.argb(225, 18, 18, 18))
@@ -1104,20 +1407,27 @@ class AutomationService : AccessibilityService() {
             wm.addView(bar, interventionParams(Gravity.TOP, focusable = false))
             interventionRoot = bar
             overlayMode = "manual"
+            overlayReady = true
+            overlayStatus = "真人操作条已显示：TYPE_ACCESSIBILITY_OVERLAY 添加成功"
             TaskStore.appendLog(this, "真人接管：自动化已暂停，你可以手动操作；处理完点顶部“继续识别”。")
         } catch (e: Exception) {
-            TaskStore.appendLog(this, "真人操作条打开失败：${e.message}")
+            overlayReady = false
+            overlayStatus = "真人操作条添加失败：WindowManager.addView 失败：${e.javaClass.simpleName}: ${e.message}"
+            TaskStore.appendLog(this, overlayStatus)
         }
     }
 
     fun removeIntervention() {
-        val root = interventionRoot ?: return
+        val root = interventionRoot
         interventionRoot = null
+        overlaySelfTestTarget = null
         interventionNote = null
         interventionStatus = null
         interventionSnapshot = null
         panelRefreshScheduled = false
         overlayMode = "none"
+        overlayReady = false
+        if (root == null) return
         try {
             getSystemService(WindowManager::class.java)?.removeView(root)
         } catch (_: Exception) {
@@ -1441,16 +1751,20 @@ class AutomationService : AccessibilityService() {
             clipboard.setPrimaryClip(ClipData.newPlainText("automation_comment", text))
             node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
             val pasted = node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
-            pasted && inputContains(node, probe)
+            val fresh = rootInActiveWindow?.let { findEditableCommentBox(it) } ?: node
+            pasted && inputMatchesComment(fresh.text?.toString() ?: "", text)
         } catch (_: Exception) {
             false
         }
     }
 
     private fun fillCommentText(node: AccessibilityNodeInfo, text: String, probe: String): Boolean {
-        if (setText(node, text) && inputContains(node, probe)) return true
+        if (setText(node, text)) {
+            val afterSet = rootInActiveWindow?.let { findEditableCommentBox(it) } ?: node
+            if (inputMatchesComment(afterSet.text?.toString() ?: "", text)) return true
+        }
         val fresh = rootInActiveWindow?.let { findEditableCommentBox(it) } ?: node
-        if (inputContains(fresh, probe)) return true
+        if (inputMatchesComment(fresh.text?.toString() ?: "", text)) return true
         pasteTried = true
         return pasteText(fresh, text, probe)
     }
@@ -1645,7 +1959,12 @@ class AutomationService : AccessibilityService() {
                 afterSettingOverlayClosed()
             }
         }
-        val bar = topBar("$platform $kindName：十字圆心对准按键中心", listOf(saveBtn, cancelBtn))
+        val barLabel = if (kind == PointStore.KIND_SEND) {
+            "$platform $kindName：先打开键盘让发送键可见，再对准发送键中心"
+        } else {
+            "$platform $kindName：十字圆心对准按键中心"
+        }
+        val bar = topBar(barLabel, listOf(saveBtn, cancelBtn))
         val nudgeBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.argb(180, 0, 0, 0))
@@ -1665,7 +1984,8 @@ class AutomationService : AccessibilityService() {
         try {
             wm.addView(root, overlayParams())
             calibrationRoot = root
-            TaskStore.appendLog(this, "校准悬浮窗已打开：$platform $kindName，切到 $platform 视频页，十字圆心对准按键中心点保存。")
+            val warning = if (kind == PointStore.KIND_SEND) "发送点要在键盘打开、发送键可见时校准；" else ""
+            TaskStore.appendLog(this, "校准悬浮窗已打开：$platform $kindName，$warning 切到 $platform 视频页，十字圆心对准按键中心点保存。")
         } catch (e: Exception) {
             TaskStore.appendLog(this, "校准悬浮窗打开失败：${e.message}")
         }
@@ -1679,7 +1999,10 @@ class AutomationService : AccessibilityService() {
         val preview = PreviewView(this, platform)
         val closeBtn = Button(this).apply {
             text = "关闭悬浮窗"
-            setOnClickListener { removeCalibration() }
+            setOnClickListener {
+                removeCalibration()
+                showMiniOverlay()
+            }
         }
         val bar = topBar("$platform 点位悬浮窗：绿=评论点 红=发送点，拖动可改", listOf(closeBtn))
         root.addView(preview, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
@@ -1703,164 +2026,101 @@ class AutomationService : AccessibilityService() {
     }
 
     private fun afterSettingOverlayClosed() {
-        if (pausedForHuman) showInterventionPanel(lastFailureReason.ifBlank { "悬浮控制窗：点位和状态已更新" })
-    }
-
-
-    // ---------- 模拟真人器：记录点击 + 真实回放 ----------
-
-    private inner class RecorderView(context: Context) : View(context) {
-        val points = mutableListOf<Pair<Float, Float>>()
-        private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.RED
-            style = Paint.Style.FILL
-        }
-        private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.RED
-            style = Paint.Style.STROKE
-            strokeWidth = 5f
-        }
-        private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            textSize = 40f
-            isFakeBoldText = true
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            points.forEachIndexed { i, pt ->
-                canvas.drawCircle(pt.first, pt.second, 46f, ringPaint)
-                canvas.drawCircle(pt.first, pt.second, 30f, dotPaint)
-                canvas.drawText("${i + 1}", pt.first - 12f, pt.second + 14f, textPaint)
-            }
-        }
-
-        override fun onTouchEvent(event: MotionEvent): Boolean {
-            if (event.action == MotionEvent.ACTION_UP) {
-                points.add(event.x to event.y)
-                invalidate()
-                TaskStore.appendLog(this@AutomationService, "已记录第 ${points.size} 个点击位置")
-            }
-            return true
+        if (pausedForHuman) {
+            showInterventionPanel(lastFailureReason.ifBlank { "悬浮控制窗：点位和状态已更新" })
+        } else {
+            showMiniOverlay()
         }
     }
 
-    fun showRecorder(platform: String) {
-        removeCalibration()
-        val wm = getSystemService(WindowManager::class.java) ?: return
-        val root = FrameLayout(this)
-        val recorder = RecorderView(this)
-        val doneBtn = Button(this).apply {
-            text = "完成记录"
-            setOnClickListener {
-                if (root.width > 0 && root.height > 0 && recorder.points.isNotEmpty()) {
-                    val steps = recorder.points.map { pt ->
-                        TapSequenceStore.Step(
-                            TapSequenceStore.TYPE_TAP,
-                            pt.first / root.width,
-                            pt.second / root.height,
-                            1
-                        )
-                    }
-                    TapSequenceStore.saveSteps(this@AutomationService, platform, steps)
-                    TaskStore.appendLog(this@AutomationService, "点击序列已保存：$platform 共 ${steps.size} 个点位，软件记住了。")
-                    android.widget.Toast.makeText(this@AutomationService, "$platform 已记住 ${steps.size} 个点位", android.widget.Toast.LENGTH_SHORT).show()
+
+    private fun runTriggerSelfTestInternal(xPx: Int, yPx: Int, source: String, onResult: (Boolean, String) -> Unit) {
+        if (xPx <= 0 || yPx <= 0) {
+            triggerSelfTestPassed = false
+            triggerSelfTestStatus = "触发自检失败：检测目标坐标无效（X=$xPx Y=$yPx）"
+            TaskStore.appendLog(this, triggerSelfTestStatus)
+            onResult(false, triggerSelfTestStatus)
+            return
+        }
+        pendingSelfTestStartedAt = System.currentTimeMillis()
+        pendingSelfTestSource = source
+        triggerSelfTestPassed = false
+        triggerSelfTestStatus = "触发自检进行中：正在向$source 派发无障碍手势（X=$xPx Y=$yPx）"
+        TaskStore.appendLog(this, "触发自检开始：期望手势完成且$source 回显，目标坐标 X=$xPx Y=$yPx")
+        tapAtPixel(xPx.toFloat(), yPx.toFloat(), "触发自检") { gestureOk ->
+            if (!gestureOk) {
+                triggerSelfTestPassed = false
+                triggerSelfTestStatus = "触发自检失败：手势未完成（派发失败或被系统取消），检测目标没有可信回显"
+                TaskStore.appendLog(this, triggerSelfTestStatus)
+                onResult(false, triggerSelfTestStatus)
+                return@tapAtPixel
+            }
+            handler.postDelayed({
+                val echoOk = lastTriggerEchoAtMillis >= pendingSelfTestStartedAt && lastTriggerEchoSource == source
+                if (echoOk) {
+                    triggerSelfTestPassed = true
+                    triggerSelfTestAtMillis = System.currentTimeMillis()
+                    triggerSelfTestStatus = "触发自检通过：手势完成且$source 已回显，时间=${timeText(lastTriggerEchoAtMillis)}"
                 } else {
-                    TaskStore.appendLog(this@AutomationService, "记录取消：还没有点任何位置。")
+                    triggerSelfTestPassed = false
+                    triggerSelfTestStatus = "触发自检失败：手势已完成，但$source 没有回显（期望回显来源=$source，实际来源=${lastTriggerEchoSource.ifBlank { "无" }}；目标可能不在前台、坐标不对或被遮挡）"
                 }
-                removeCalibration()
-                afterSettingOverlayClosed()
-            }
-        }
-        val cancelBtn = Button(this).apply {
-            text = "取消"
-            setOnClickListener {
-                removeCalibration()
-                afterSettingOverlayClosed()
-            }
-        }
-        val bar = topBar("记录 $platform 点击：切到 $platform，按顺序点你要点的按键", listOf(doneBtn, cancelBtn))
-        root.addView(recorder, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        root.addView(bar, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP))
-        try {
-            wm.addView(root, overlayParams())
-            calibrationRoot = root
-            android.widget.Toast.makeText(this, "记录悬浮窗已打开", android.widget.Toast.LENGTH_SHORT).show()
-            TaskStore.appendLog(this, "记录悬浮窗已打开：切到 $platform，按顺序点评论键、输入框、发送键，点完按完成记录。")
-        } catch (e: Exception) {
-            TaskStore.appendLog(this, "记录悬浮窗打开失败：${e.message}")
-            android.widget.Toast.makeText(this, "悬浮窗打开失败：${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                TaskStore.appendLog(this, triggerSelfTestStatus)
+                onResult(triggerSelfTestPassed, triggerSelfTestStatus)
+            }, 900L)
         }
     }
 
-    /** 按记录的序列真实回放：点位逐个点（每点按设置次数），填评论步填入并验证。 */
-    fun runSequence(platform: String, comment: String) {
-        val steps = TapSequenceStore.loadSteps(this, platform)
-        if (steps.isEmpty()) {
-            val reason = "执行失败：$platform 还没有记录点击，先点“开始记录点击”把位置记下来。"
-            TaskStore.appendLog(this, reason)
-            saveCurrentErrorReport(this, reason, "")
-            showInterventionPanel(reason)
+    private fun runOverlayTriggerSelfTest() {
+        val target = overlaySelfTestTarget
+        if (target == null || target.width <= 0 || target.height <= 0) {
+            triggerSelfTestPassed = false
+            triggerSelfTestStatus = "触发自检失败：悬浮窗检测区还没显示或尺寸为 0"
+            TaskStore.appendLog(this, triggerSelfTestStatus)
+            updateInterventionPanel()
             return
         }
-        val repeat = TapSequenceStore.loadRepeat(this, platform)
-        TaskStore.appendLog(this, "开始执行 $platform 点击序列：${steps.size} 步，重复 $repeat 遍。")
-        execStep(platform, steps, comment, 1, repeat, 0)
-    }
-
-    private fun execStep(platform: String, steps: List<TapSequenceStore.Step>, comment: String, round: Int, repeat: Int, index: Int) {
-        if (index >= steps.size) {
-            if (round < repeat) {
-                TaskStore.appendLog(this, "第 $round 遍完成，继续第 ${round + 1} 遍…")
-                handler.postDelayed({ execStep(platform, steps, comment, round + 1, repeat, 0) }, 1200L)
+        val loc = IntArray(2)
+        target.getLocationOnScreen(loc)
+        val cx = loc[0] + target.width / 2
+        val cy = loc[1] + target.height / 2
+        target.text = "触发检测区：等待回显"
+        runTriggerSelfTestInternal(cx, cy, "悬浮窗检测区") { ok, message ->
+            overlaySelfTestTarget?.text = if (ok) {
+                "触发检测区：已回显 ${timeText(lastTriggerEchoAtMillis)}"
             } else {
-                TaskStore.appendLog(this, "点击序列执行完成（$platform，共 $repeat 遍）。")
+                "触发检测区：未回显"
             }
-            return
-        }
-        val step = steps[index]
-        val nextDelay = 600L + kotlin.random.Random.nextLong(0, 500)
-        if (step.type == TapSequenceStore.TYPE_FILL) {
-            val root = rootInActiveWindow
-            val input = root?.let { findEditableCommentBox(it) }
-            if (input != null && setText(input, comment)) {
-                val probe = comment.take(6)
-                val verified = rootInActiveWindow?.let { findEditableCommentBox(it)?.text?.toString()?.contains(probe) } == true
-                TaskStore.appendLog(this, "第 ${index + 1} 步填评论：${if (verified) "已填入并验证" else "已填入，未验证到文字"}")
-                if (!verified) {
-                    val reason = "第 ${index + 1} 步填评论失败：填入后没有验证到文字，已暂停等真人介入。"
-                    saveCurrentErrorReport(this, reason, "")
-                    showInterventionPanel(reason)
-                    return
-                }
-            } else {
-                val reason = "第 ${index + 1} 步填评论失败：找不到可填的输入框（先点输入框再填），已暂停等真人介入。"
-                TaskStore.appendLog(this, reason)
-                saveCurrentErrorReport(this, reason, "")
-                showInterventionPanel(reason)
-                return
-            }
-            handler.postDelayed({ execStep(platform, steps, comment, round, repeat, index + 1) }, nextDelay)
-            return
-        }
-        tapTimes(step, step.count) {
-            handler.postDelayed({ execStep(platform, steps, comment, round, repeat, index + 1) }, nextDelay)
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+            updateInterventionPanel()
         }
     }
 
-    private fun tapTimes(step: TapSequenceStore.Step, remaining: Int, done: () -> Unit) {
-        if (remaining <= 0) {
-            done()
-            return
+    private fun tapAtPixel(xPx: Float, yPx: Float, label: String, onDone: ((Boolean) -> Unit)? = null) {
+        val path = Path().apply { moveTo(xPx, yPx) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 80))
+            .build()
+        var finished = false
+        fun finish(ok: Boolean, message: String) {
+            if (finished) return
+            finished = true
+            TaskStore.appendLog(this@AutomationService, message)
+            onDone?.invoke(ok)
         }
-        tapAtFraction(step.x, step.y, "真实点击") { ok ->
-            if (!ok) {
-                val reason = "真实点击失败：手势没有完成（X ${(step.x * 100).toInt()}% · Y ${(step.y * 100).toInt()}%），已暂停等真人介入。"
-                saveCurrentErrorReport(this, reason, "")
-                showInterventionPanel(reason)
-                return@tapAtFraction
+        val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) {
+                finish(true, "$label：手势已完成（X=${xPx.toInt()} Y=${yPx.toInt()}）")
             }
-            handler.postDelayed({ tapTimes(step, remaining - 1, done) }, 380L)
+
+            override fun onCancelled(gestureDescription: GestureDescription?) {
+                finish(false, "$label：手势被系统取消（X=${xPx.toInt()} Y=${yPx.toInt()}）")
+            }
+        }, handler)
+        if (!dispatched) {
+            finish(false, "$label：手势派发失败（X=${xPx.toInt()} Y=${yPx.toInt()}）")
+        } else {
+            TaskStore.appendLog(this, "$label：手势已派发，等待系统完成回调（X=${xPx.toInt()} Y=${yPx.toInt()}）")
         }
     }
 
@@ -1901,9 +2161,24 @@ class AutomationService : AccessibilityService() {
         publishRunning = false
     }
 
+    override fun onUnbind(intent: Intent?): Boolean {
+        removeCalibration()
+        removeIntervention()
+        overlayReady = false
+        overlayStatus = "悬浮按钮已移除：无障碍服务已解绑"
+        triggerSelfTestPassed = false
+        triggerSelfTestStatus = "触发自检未通过：无障碍服务已解绑"
+        instance = null
+        return super.onUnbind(intent)
+    }
+
     override fun onDestroy() {
         removeCalibration()
         removeIntervention()
+        overlayReady = false
+        overlayStatus = "悬浮按钮已移除：无障碍服务已销毁"
+        triggerSelfTestPassed = false
+        triggerSelfTestStatus = "触发自检未通过：无障碍服务已销毁"
         super.onDestroy()
         instance = null
     }
